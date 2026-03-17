@@ -209,7 +209,13 @@ def convert_t5(tensors: Dict[str, np.ndarray], output: str, tokenizer_path: Opti
             tok = HFT5Tok.from_pretrained(tokenizer_path)
             vocab = [tok.convert_ids_to_tokens(i) for i in range(tok.vocab_size)]
             w.writer.add_array("tokenizer.ggml.tokens", vocab)
-            print(f"  embedded tokenizer ({len(vocab)} tokens)")
+            # Write SentencePiece unigram log-probability scores.
+            # Presence of this key enables Viterbi-optimal segmentation in the
+            # C++ tokenizer (t5_encoder.hpp); without it, greedy longest-match
+            # is used, which is already a strong fallback.
+            scores = [tok.sp_model.GetScore(i) for i in range(len(vocab))]
+            w.writer.add_token_scores(scores)
+            print(f"  embedded tokenizer ({len(vocab)} tokens + unigram scores)")
         except Exception as e:
             print(f"  warning: could not embed tokenizer: {e}")
 

@@ -613,18 +613,33 @@ from the VAE GGUF (`vae.temporal_scale`, `vae.spatial_scale`).
 
 ### Tokenizer
 
-The T5 tokenizer uses a SentencePiece vocabulary embedded in the GGUF as a
-string array (`tokenizer.ggml.tokens`).  Tokenisation proceeds:
+The T5 tokenizer implements the **SentencePiece unigram** algorithm in pure
+C++ with no external library dependency.  The vocabulary and optional
+log-probability scores are loaded from the GGUF metadata at model-load time:
 
-1. Split input on whitespace.
-2. For each word, prepend the `▁` (U+2581) sentinel.
-3. Look up the full token in the vocabulary map.
-4. On miss, fall back to individual character lookup; unknown chars map to
-   `unk_id=2`.
-5. Append EOS (`eos_id=1`), pad to `max_len=512`.
+| GGUF key | Type | Description |
+|----------|------|-------------|
+| `tokenizer.ggml.tokens` | string[] | id → piece (UTF-8, ▁-prefixed) |
+| `tokenizer.ggml.scores` | float32[] | id → unigram log-probability (optional) |
 
-This is intentionally simplified.  For best prompt fidelity, replace the
-`T5Tokenizer::encode()` body with a proper BPE or unigram segmenter.
+**Preprocessing** (`T5Tokenizer::preprocess`):
+1. Collapse runs of whitespace to a single space; strip leading/trailing.
+2. Prepend `▁` (U+2581) to the beginning; replace each remaining space with `▁`.
+
+**Segmentation** — two modes depending on whether scores are in the GGUF:
+
+| Mode | Condition | Algorithm |
+|------|-----------|-----------|
+| Viterbi | `tokenizer.ggml.scores` present | DP over byte positions; maximises sum of log-probs; O(n × max_piece_len) |
+| Greedy | scores absent | Longest-match scan from left; O(n × max_piece_len) |
+
+In both modes an **unk fallback** advances one full UTF-8 character (not one
+byte) when no vocabulary piece covers the current position, preventing split
+multi-byte sequences from producing garbage tokens.
+
+Scores are written by `convert.py --tokenizer` (via
+`tok.sp_model.GetScore(i)`) and preserved through quantization by
+`ltx-quantize` (via `gguf_set_kv`).
 
 ---
 
@@ -661,8 +676,8 @@ and where contributions are most welcome.
 | 2 | **VAE encoder** | Only the first `conv_in` layer is used; pseudo-encoding fallback | Implement full encoder stack for accurate I2V latent inversion |
 | 3 | **AdaLN-single** | Timestep embedding is computed but per-block scale/shift is not fully applied | Apply `ada_params` chunks as scale/shift in each block's norms |
 | 4 | **3-D RoPE** | Positional embeddings are not yet applied | Add rotary embeddings along (t, h, w) axes to Q and K tensors |
-| 5 | **T5 tokenizer** | Whitespace-split + per-char fallback | Replace with a proper SentencePiece unigram/BPE tokenizer |
-| 6 | **`ltx-quantize` metadata** | String arrays (tokenizer vocab) are skipped during quantization | Copy `GGUF_TYPE_ARRAY` entries in the KV copy loop |
+| 5 | **T5 tokenizer** | ~~Whitespace-split + per-char fallback~~ **Fixed**: full SentencePiece unigram Viterbi DP (when scores in GGUF) or greedy longest-match | — |
+| 6 | **`ltx-quantize` metadata** | ~~String arrays (tokenizer vocab) are skipped during quantization~~ **Fixed**: `gguf_set_kv` copies all KV pairs including arrays | — |
 | 7 | **Persistent scratch** | DiT allocates 1 GB of ggml scratch per forward call | Pre-allocate a single scratch context and reset between calls |
 | 8 | **Batch size > 1** | Only batch=1 is implemented | Add batch dimension to enable parallel generation |
 | 9 | **CFG single-pass** | CFG requires two full forward passes | Implement single-pass CFG by duplicating the batch |

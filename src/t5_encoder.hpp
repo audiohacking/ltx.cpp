@@ -15,6 +15,9 @@
 
 #include "ltx_common.hpp"
 
+#include <algorithm>
+#include <unordered_map>
+
 struct T5Config {
     int d_model       = 4096;   // hidden size
     int d_kv          = 64;     // key/value dim per head
@@ -26,66 +29,186 @@ struct T5Config {
     float eps         = 1e-6f;  // layer norm eps
 };
 
-// ── Simple BPE tokenizer (SentencePiece-compatible, loaded from GGUF) ────────
+// ── SentencePiece unigram tokenizer ──────────────────────────────────────────
+//
+// Implements the SentencePiece unigram algorithm used by T5:
+//   - Text preprocessing: whitespace normalisation + ▁ (U+2581) insertion.
+//   - Segmentation: Viterbi DP when unigram log-probability scores are present
+//     in the GGUF (key "tokenizer.ggml.scores"); greedy longest-match otherwise.
+//   - Fallback: characters with no vocabulary piece are emitted as unk_id,
+//     advancing one full UTF-8 character to avoid splitting multi-byte sequences.
+//
+// Vocabulary and optional scores are read from GGUF metadata:
+//   "tokenizer.ggml.tokens"  – string array: id → piece (UTF-8, ▁-prefixed)
+//   "tokenizer.ggml.scores"  – float32 array: id → unigram log-probability
 
 struct T5Tokenizer {
-    std::vector<std::string> vocab;  // id → token string
-    std::map<std::string, int> tok2id;
-    int unk_id = 2, pad_id = 0, eos_id = 1;
+    std::vector<std::string>             vocab;          // id → piece
+    std::vector<float>                   scores;         // id → log-prob (empty → greedy mode)
+    std::unordered_map<std::string, int> tok2id;         // piece → id (O(1) lookup)
+    int  unk_id        = 2;
+    int  pad_id        = 0;
+    int  eos_id        = 1;
+    int  max_piece_len = 0;   // max byte-length of any vocabulary piece
 
-    // Load vocabulary from GGUF KV array "tokenizer.ggml.tokens".
+    // Load vocabulary and (optional) scores from GGUF metadata.
     bool load_from_gguf(struct gguf_context * gc) {
-        int64_t kid = gguf_find_key(gc, "tokenizer.ggml.tokens");
-        if (kid < 0) {
+        int64_t tokens_kid = gguf_find_key(gc, "tokenizer.ggml.tokens");
+        if (tokens_kid < 0) {
             LTX_ERR("T5 tokenizer: 'tokenizer.ggml.tokens' not found in GGUF");
             return false;
         }
-        int64_t n = gguf_get_arr_n(gc, kid);
+        size_t n = gguf_get_arr_n(gc, tokens_kid);
         vocab.resize(n);
-        for (int64_t i = 0; i < n; ++i) {
-            vocab[i] = gguf_get_arr_str(gc, kid, i);
+        for (size_t i = 0; i < n; ++i) {
+            vocab[i] = gguf_get_arr_str(gc, tokens_kid, i);
             tok2id[vocab[i]] = static_cast<int>(i);
+            int len = static_cast<int>(vocab[i].size());
+            if (len > max_piece_len) max_piece_len = len;
         }
-        LTX_LOG("T5 tokenizer: loaded %lld tokens", (long long)n);
+
+        // Optional: unigram log-probability scores → enables Viterbi mode.
+        int64_t scores_kid = gguf_find_key(gc, "tokenizer.ggml.scores");
+        if (scores_kid >= 0 &&
+                gguf_get_arr_type(gc, scores_kid) == GGUF_TYPE_FLOAT32) {
+            size_t ns = gguf_get_arr_n(gc, scores_kid);
+            const float * raw = reinterpret_cast<const float *>(
+                gguf_get_arr_data(gc, scores_kid));
+            if (raw) scores.assign(raw, raw + ns);
+        }
+
+        LTX_LOG("T5 tokenizer: loaded %zu tokens, max_piece=%d bytes, mode=%s",
+                n, max_piece_len, scores.empty() ? "greedy" : "Viterbi");
         return true;
     }
 
-    // Naïve whitespace + subword tokenisation (SentencePiece ▁ prefix).
-    // For production use, replace with a proper SentencePiece unigram tokenizer.
-    std::vector<int> encode(const std::string & text, int max_len) const {
-        std::vector<int> ids;
-
-        // Split on whitespace and look up each word (incl. subword fall-back).
-        std::string cur;
-        auto flush = [&]() {
-            if (cur.empty()) return;
-            // prepend ▁ (U+2581 = \xe2\x96\x81)
-            std::string tok = "\xe2\x96\x81" + cur;
-            auto it = tok2id.find(tok);
-            if (it != tok2id.end()) {
-                ids.push_back(it->second);
+    // SentencePiece text normalisation:
+    //   1. Collapse runs of whitespace to a single space; strip leading/trailing.
+    //   2. Prepend ▁ and replace each remaining space with ▁.
+    static std::string preprocess(const std::string & text) {
+        // Step 1: collapse and strip.
+        std::string stripped;
+        stripped.reserve(text.size());
+        bool prev_ws = true;  // treat start as whitespace to drop leading ws
+        for (unsigned char c : text) {
+            bool is_ws = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            if (is_ws) {
+                if (!prev_ws) stripped += ' ';
             } else {
-                // fall back character by character
-                for (char c : cur) {
-                    std::string ct(1, c);
-                    auto it2 = tok2id.find(ct);
-                    ids.push_back(it2 != tok2id.end() ? it2->second : unk_id);
+                stripped += static_cast<char>(c);
+            }
+            prev_ws = is_ws;
+        }
+        while (!stripped.empty() && stripped.back() == ' ') stripped.pop_back();
+
+        // Step 2: insert ▁ (U+2581 = \xe2\x96\x81, 3 bytes).
+        static const char SPIECE[4] = "\xe2\x96\x81";
+        std::string out;
+        out.reserve(stripped.size() * 2);
+        out.append(SPIECE, 3);          // always prepend ▁
+        for (char c : stripped) {
+            if (c == ' ') out.append(SPIECE, 3);
+            else          out += c;
+        }
+        return out;
+    }
+
+    // Return the byte-length of the UTF-8 character whose first byte is `b`.
+    static int utf8_char_len(unsigned char b) {
+        if (b < 0x80)            return 1;   // 0xxxxxxx – ASCII
+        if ((b & 0xE0) == 0xC0)  return 2;   // 110xxxxx – 2-byte
+        if ((b & 0xF0) == 0xE0)  return 3;   // 1110xxxx – 3-byte (e.g. ▁)
+        if ((b & 0xF8) == 0xF0)  return 4;   // 11110xxx – 4-byte
+        return 1;                             // invalid continuation byte: skip
+    }
+
+    // Viterbi optimal segmentation maximising the sum of unigram log-probs.
+    std::vector<int> viterbi(const std::string & text) const {
+        int n = static_cast<int>(text.size());
+        if (n == 0) return {};
+
+        constexpr float NEG_INF = -1e38f;
+        // best[i]: best total score for text[0..i)
+        std::vector<float>             best(n + 1, NEG_INF);
+        // from[i]: {prev_position, token_id} that achieves best[i]
+        std::vector<std::pair<int,int>> from(n + 1, {-1, -1});
+        best[0] = 0.0f;
+
+        for (int i = 0; i < n; ++i) {
+            if (best[i] <= NEG_INF / 2.0f) continue;
+            int  max_len   = std::min(max_piece_len, n - i);
+            bool any_match = false;
+            for (int len = 1; len <= max_len; ++len) {
+                auto it = tok2id.find(text.substr(i, len));
+                if (it == tok2id.end()) continue;
+                int   tok      = it->second;
+                float sc       = (tok < static_cast<int>(scores.size()))
+                                 ? scores[tok] : 0.0f;
+                float new_best = best[i] + sc;
+                if (new_best > best[i + len]) {
+                    best[i + len] = new_best;
+                    from[i + len] = {i, tok};
+                }
+                any_match = true;
+            }
+            // No vocabulary piece covers position i: skip one UTF-8 char as unk.
+            if (!any_match) {
+                int skip = std::min(utf8_char_len(
+                    static_cast<unsigned char>(text[i])), n - i);
+                constexpr float UNK_PENALTY = -10.0f;
+                if (best[i] + UNK_PENALTY > best[i + skip]) {
+                    best[i + skip] = best[i] + UNK_PENALTY;
+                    from[i + skip] = {i, unk_id};
                 }
             }
-            cur.clear();
-        };
-
-        for (char c : text) {
-            if (c == ' ') { flush(); }
-            else          { cur += c; }
         }
-        flush();
 
-        // Append EOS, pad / truncate to max_len.
+        // Backtrack from position n.
+        std::vector<int> ids;
+        for (int pos = n; pos > 0;) {
+            auto [prev, tok] = from[pos];
+            if (prev < 0) { ids.push_back(unk_id); break; }
+            ids.push_back(tok);
+            pos = prev;
+        }
+        std::reverse(ids.begin(), ids.end());
+        return ids;
+    }
+
+    // Greedy longest-match segmentation (fallback when scores are absent).
+    std::vector<int> greedy(const std::string & text) const {
+        std::vector<int> ids;
+        int n   = static_cast<int>(text.size());
+        int pos = 0;
+        while (pos < n) {
+            int  max_len = std::min(max_piece_len, n - pos);
+            bool found   = false;
+            for (int len = max_len; len >= 1; --len) {
+                auto it = tok2id.find(text.substr(pos, len));
+                if (it != tok2id.end()) {
+                    ids.push_back(it->second);
+                    pos  += len;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                ids.push_back(unk_id);
+                pos += std::min(utf8_char_len(
+                    static_cast<unsigned char>(text[pos])), n - pos);
+            }
+        }
+        return ids;
+    }
+
+    // Tokenise text; pad or truncate to max_len (EOS is appended before padding).
+    std::vector<int> encode(const std::string & text, int max_len) const {
+        std::string      processed = preprocess(text);
+        std::vector<int> ids       = scores.empty() ? greedy(processed)
+                                                    : viterbi(processed);
         ids.push_back(eos_id);
-        while ((int)ids.size() < max_len) ids.push_back(pad_id);
-        if ((int)ids.size() > max_len)    ids.resize(max_len);
-
+        while (static_cast<int>(ids.size()) < max_len) ids.push_back(pad_id);
+        if  (static_cast<int>(ids.size()) > max_len)   ids.resize(max_len);
         return ids;
     }
 };

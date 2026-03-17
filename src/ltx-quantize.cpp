@@ -59,31 +59,8 @@ int main(int argc, char ** argv) {
     // Build output GGUF.
     struct gguf_context * out_ctx = gguf_init_empty();
 
-    // Copy all KV metadata.
-    int64_t n_kv = gguf_get_n_kv(src.gguf_ctx);
-    for (int64_t i = 0; i < n_kv; ++i) {
-        const char * key  = gguf_get_key(src.gguf_ctx, i);
-        enum gguf_type vt = gguf_get_kv_type(src.gguf_ctx, i);
-        switch (vt) {
-            case GGUF_TYPE_STRING:
-                gguf_set_val_str(out_ctx, key, gguf_get_val_str(src.gguf_ctx, i));
-                break;
-            case GGUF_TYPE_UINT32:
-                gguf_set_val_u32(out_ctx, key, gguf_get_val_u32(src.gguf_ctx, i));
-                break;
-            case GGUF_TYPE_INT32:
-                gguf_set_val_i32(out_ctx, key, gguf_get_val_i32(src.gguf_ctx, i));
-                break;
-            case GGUF_TYPE_FLOAT32:
-                gguf_set_val_f32(out_ctx, key, gguf_get_val_f32(src.gguf_ctx, i));
-                break;
-            case GGUF_TYPE_BOOL:
-                gguf_set_val_bool(out_ctx, key, gguf_get_val_bool(src.gguf_ctx, i));
-                break;
-            default:
-                break; // arrays etc. – skip for now
-        }
-    }
+    // Copy all KV metadata (scalars and arrays alike).
+    gguf_set_kv(out_ctx, src.gguf_ctx);
 
     // Add quantized tensors.
     for (int ti = 0; ti < n_tensors; ++ti) {
