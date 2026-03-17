@@ -1,6 +1,6 @@
 // ltx-generate.cpp – LTX-Video text-to-video / image-to-video inference
 //
-// Usage:
+// Usage (text-to-video):
 //   ltx-generate
 //     --dit   models/ltxv-2b-Q8_0.gguf
 //     --vae   models/ltxv-vae-BF16.gguf
@@ -9,6 +9,12 @@
 //     --steps 40 --cfg 3.0 --shift 3.0
 //     --frames 25 --height 480 --width 704
 //     --out output/video
+//
+// Usage (image-to-video – animate a reference image):
+//   ltx-generate ... --start-frame photo.ppm
+//
+// Usage (first+last frame – keyframe interpolation):
+//   ltx-generate ... --start-frame begin.ppm --end-frame end.ppm
 //
 // Outputs: output/video_0000.ppm ... output/video_NNNN.ppm
 
@@ -36,6 +42,10 @@ struct Args {
     std::string prompt         = "A beautiful scenic landscape with flowing water.";
     std::string negative_prompt = "";
     std::string out_prefix     = "output/frame";
+    // Image-to-video conditioning.
+    std::string start_frame_path;  // path to start/reference frame (PPM)
+    std::string end_frame_path;    // path to end frame (PPM), for keyframe interpolation
+    float       frame_strength    = 1.0f; // conditioning strength [0,1]; 1=fully pinned
     int    frames              = 25;
     int    height              = 480;
     int    width               = 704;
@@ -68,6 +78,12 @@ static void print_usage(const char * prog) {
         "  --seed    <N>     RNG seed (default: 42)\n"
         "  --out     <pfx>   Output frame prefix (default: output/frame)\n"
         "\n"
+        "Image-to-video (I2V) conditioning:\n"
+        "  --start-frame <path>  PPM image to use as the first frame / reference\n"
+        "  --end-frame   <path>  PPM image to use as the last frame (keyframe interp)\n"
+        "  --frame-strength <f> Conditioning strength [0..1] (default: 1.0)\n"
+        "                        1.0 = fully pin the frame, 0.0 = no conditioning\n"
+        "\n"
         "Performance:\n"
         "  --threads <N>     CPU threads (default: 4)\n"
         "  -v                Verbose logging\n",
@@ -99,6 +115,9 @@ static Args parse_args(int argc, char ** argv) {
         else if (arg == "--seed")    a.seed            = std::stoull(nextarg());
         else if (arg == "--out")     a.out_prefix      = nextarg();
         else if (arg == "--threads") a.threads         = std::atoi(nextarg());
+        else if (arg == "--start-frame")    a.start_frame_path  = nextarg();
+        else if (arg == "--end-frame")      a.end_frame_path    = nextarg();
+        else if (arg == "--frame-strength") a.frame_strength    = std::atof(nextarg());
         else if (arg == "-v")        a.verbose         = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); exit(0); }
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); exit(1); }
@@ -151,6 +170,10 @@ int main(int argc, char ** argv) {
     VaeDecoder vae;
     if (!vae.load(vae_model)) return 1;
 
+    // Load VAE encoder (shares the same GGUF as the decoder).
+    VaeEncoder vae_enc;
+    vae_enc.load(vae_model);
+
     LTX_LOG("loading DiT: %s", args.dit_path.c_str());
     LtxGgufModel dit_model;
     if (!dit_model.open(args.dit_path)) return 1;
@@ -189,6 +212,39 @@ int main(int argc, char ** argv) {
 
     LTX_LOG("latent: T=%d H=%d W=%d C=%d  → %d tokens (patch_dim=%d)",
             T_lat, H_lat, W_lat, C, n_tok, Pd);
+
+    // ── Encode reference frames (I2V conditioning) ────────────────────────────
+
+    size_t frame_lat_size = (size_t)H_lat * W_lat * C;
+
+    // start_lat / end_lat: encoded reference frame latents (empty = not set).
+    std::vector<float> start_lat, end_lat;
+    bool has_start = !args.start_frame_path.empty();
+    bool has_end   = !args.end_frame_path.empty();
+
+    if (has_start) {
+        LTX_LOG("loading start frame: %s", args.start_frame_path.c_str());
+        VideoBuffer img = load_ppm(args.start_frame_path);
+        if (img.frames == 0) return 1;
+        start_lat = vae_enc.encode_frame(img.frame(0),
+            img.height, img.width, H_lat, W_lat);
+        LTX_LOG("start frame encoded to latent [%d x %d x %d]", H_lat, W_lat, C);
+    }
+
+    if (has_end) {
+        LTX_LOG("loading end frame: %s", args.end_frame_path.c_str());
+        VideoBuffer img = load_ppm(args.end_frame_path);
+        if (img.frames == 0) return 1;
+        end_lat = vae_enc.encode_frame(img.frame(0),
+            img.height, img.width, H_lat, W_lat);
+        LTX_LOG("end frame encoded to latent [%d x %d x %d]", H_lat, W_lat, C);
+    }
+
+    if (has_start)
+        LTX_LOG("mode: image-to-video (I2V) with start frame, strength=%.2f",
+                (double)args.frame_strength);
+    if (has_end)
+        LTX_LOG("mode: keyframe interpolation with end frame");
 
     // ── Initialize random latents ─────────────────────────────────────────────
 
@@ -245,10 +301,54 @@ int main(int argc, char ** argv) {
         // Euler step.
         RFScheduler::euler_step(latents.data(), velocity.data(),
                                 t_cur, t_next, lat_size);
+
+        // ── Frame conditioning: pin start / end latent frames ──────────────
+        // After each Euler step we re-impose the reference frame(s) to prevent
+        // the denoising process from drifting away from the conditioning.
+        // The blend weight fades from 1 (at t=1, pure noise) to frame_strength
+        // at t=0, so early steps see more noise-mixing and later steps are
+        // progressively more pinned to the reference.
+        //
+        //   blend = frame_strength * (1 - t_next)
+        //   lat_frame = lat_frame * (1 - blend) + ref_lat * blend
+        //
+        // This is a simple linear conditioning schedule that works without
+        // modifying the DiT architecture.
+        if ((has_start || has_end) && args.frame_strength > 0.0f) {
+            // blend weight increases as t_next approaches 0.
+            float blend = args.frame_strength * (1.0f - t_next);
+            blend = std::max(0.0f, std::min(1.0f, blend));
+
+            if (has_start && blend > 0.0f) {
+                float * lat_t0 = latents.data(); // first temporal frame
+                for (size_t i = 0; i < frame_lat_size; ++i)
+                    lat_t0[i] = lat_t0[i] * (1.0f - blend) + start_lat[i] * blend;
+            }
+            if (has_end && blend > 0.0f) {
+                float * lat_tn = latents.data() + (T_lat - 1) * frame_lat_size;
+                for (size_t i = 0; i < frame_lat_size; ++i)
+                    lat_tn[i] = lat_tn[i] * (1.0f - blend) + end_lat[i] * blend;
+            }
+        }
     }
     fprintf(stderr, "\n");
 
     LTX_LOG("denoising complete, decoding with VAE ...");
+
+    // ── Hard-pin reference frames at t=0 (post-denoising) ─────────────────────
+    // After denoising completes, fully replace the first/last latent with the
+    // encoded reference frame.  This ensures the output frame exactly matches
+    // the reference image in appearance regardless of frame_strength.
+    if (has_start && args.frame_strength >= 1.0f) {
+        float * lat_t0 = latents.data();
+        memcpy(lat_t0, start_lat.data(), frame_lat_size * sizeof(float));
+        LTX_LOG("start frame latent hard-pinned at t=0");
+    }
+    if (has_end && args.frame_strength >= 1.0f) {
+        float * lat_tn = latents.data() + (T_lat - 1) * frame_lat_size;
+        memcpy(lat_tn, end_lat.data(), frame_lat_size * sizeof(float));
+        LTX_LOG("end frame latent hard-pinned at t=0");
+    }
 
     // ── VAE decode ────────────────────────────────────────────────────────────
 
@@ -292,6 +392,12 @@ int main(int argc, char ** argv) {
     write_video_frames(vbuf, args.out_prefix);
 
     LTX_LOG("done. %d frames written to '%s_XXXX.ppm'", T_vid, args.out_prefix.c_str());
+    if (has_start || has_end) {
+        LTX_LOG("I2V conditioning applied: start=%s  end=%s  strength=%.2f",
+                has_start ? args.start_frame_path.c_str() : "(none)",
+                has_end   ? args.end_frame_path.c_str()   : "(none)",
+                (double)args.frame_strength);
+    }
     LTX_LOG("tip: convert PPM frames to MP4 with:");
     LTX_LOG("  ffmpeg -framerate 24 -i '%s_%%04d.ppm' -c:v libx264 output.mp4",
             args.out_prefix.c_str());

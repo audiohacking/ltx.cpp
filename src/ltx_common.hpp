@@ -163,3 +163,105 @@ static void write_video_frames(const VideoBuffer & vbuf, const std::string & out
     }
     LTX_LOG("wrote %d PPM frames with prefix '%s'", vbuf.frames, out_prefix.c_str());
 }
+
+// ── PPM image reader ─────────────────────────────────────────────────────────
+//
+// Supports binary PPM (P6) and ASCII PPM (P5/P6).
+// Returns raw uint8 RGB pixels in a VideoBuffer with frames=1.
+// On failure returns an empty VideoBuffer (frames=0).
+
+static VideoBuffer load_ppm(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        LTX_ERR("cannot open image: %s", path.c_str());
+        return VideoBuffer(0, 0, 0);
+    }
+
+    auto skip_ws_comments = [&]() {
+        int c;
+        while ((c = fgetc(f)) != EOF) {
+            if (c == '#') { while ((c = fgetc(f)) != EOF && c != '\n') {} }
+            else if (c != ' ' && c != '\t' && c != '\n' && c != '\r') { ungetc(c, f); break; }
+        }
+    };
+
+    char magic[3] = {};
+    if (fread(magic, 1, 2, f) != 2 || magic[0] != 'P' || (magic[1] != '6' && magic[1] != '3')) {
+        LTX_ERR("unsupported image format (only P6 binary PPM supported): %s", path.c_str());
+        fclose(f);
+        return VideoBuffer(0, 0, 0);
+    }
+    bool binary = (magic[1] == '6');
+
+    skip_ws_comments();
+    int W = 0, H = 0, maxval = 0;
+    if (fscanf(f, "%d", &W) != 1 || W <= 0) { fclose(f); return VideoBuffer(0, 0, 0); }
+    skip_ws_comments();
+    if (fscanf(f, "%d", &H) != 1 || H <= 0) { fclose(f); return VideoBuffer(0, 0, 0); }
+    skip_ws_comments();
+    if (fscanf(f, "%d", &maxval) != 1 || maxval <= 0) { fclose(f); return VideoBuffer(0, 0, 0); }
+    // Consume exactly one whitespace character after maxval.
+    (void)fgetc(f);
+
+    VideoBuffer buf(1, H, W);
+    uint8_t * dst = buf.frame(0);
+
+    if (binary) {
+        size_t npix = (size_t)W * H * 3;
+        if (maxval <= 255) {
+            if (fread(dst, 1, npix, f) != npix) {
+                LTX_ERR("truncated PPM: %s", path.c_str());
+                fclose(f);
+                return VideoBuffer(0, 0, 0);
+            }
+        } else {
+            // 16-bit PPM: read big-endian uint16 and scale to uint8.
+            for (size_t i = 0; i < npix; ++i) {
+                int hi = fgetc(f), lo = fgetc(f);
+                if (hi == EOF || lo == EOF) break;
+                dst[i] = (uint8_t)(((hi << 8) | lo) * 255 / maxval);
+            }
+        }
+    } else {
+        // ASCII PPM (P3).
+        for (int i = 0; i < W * H * 3; ++i) {
+            int v = 0;
+            if (fscanf(f, "%d", &v) != 1) break;
+            dst[i] = (uint8_t)(v * 255 / maxval);
+        }
+    }
+
+    fclose(f);
+    LTX_LOG("loaded PPM: %s (%dx%d)", path.c_str(), W, H);
+    return buf;
+}
+
+// Bilinear resize of a uint8 RGB image [H_src × W_src × 3] → [H_dst × W_dst × 3].
+static std::vector<uint8_t> resize_bilinear(
+        const uint8_t * src, int W_src, int H_src,
+        int W_dst, int H_dst)
+{
+    std::vector<uint8_t> out(W_dst * H_dst * 3);
+    float sx = (float)W_src / W_dst;
+    float sy = (float)H_src / H_dst;
+
+    for (int yd = 0; yd < H_dst; ++yd)
+    for (int xd = 0; xd < W_dst; ++xd) {
+        float xf = (xd + 0.5f) * sx - 0.5f;
+        float yf = (yd + 0.5f) * sy - 0.5f;
+        int x0 = std::max(0, (int)xf),         x1 = std::min(W_src - 1, x0 + 1);
+        int y0 = std::max(0, (int)yf),         y1 = std::min(H_src - 1, y0 + 1);
+        float qx = xf - x0, qy = yf - y0;
+
+        for (int c = 0; c < 3; ++c) {
+            float v00 = src[(y0 * W_src + x0) * 3 + c];
+            float v10 = src[(y0 * W_src + x1) * 3 + c];
+            float v01 = src[(y1 * W_src + x0) * 3 + c];
+            float v11 = src[(y1 * W_src + x1) * 3 + c];
+            float v = (1 - qy) * ((1 - qx) * v00 + qx * v10)
+                    +      qy  * ((1 - qx) * v01 + qx * v11);
+            out[(yd * W_dst + xd) * 3 + c] = (uint8_t)(v + 0.5f);
+        }
+    }
+    return out;
+}

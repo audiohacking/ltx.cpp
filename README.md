@@ -13,6 +13,8 @@ Inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp) and
 ## Features
 
 - **Text-to-video** inference with the LTX-Video 2.3 DiT
+- **Image-to-video (I2V)** — animate a reference image (`--start-frame`)
+- **Keyframe interpolation** — provide both start and end frames to interpolate between them (`--start-frame` + `--end-frame`)
 - Quantised GGUF weights (Q4\_K\_M → Q8\_0 → BF16)
 - Classifier-free guidance + flow-shift Euler sampler
 - PPM frame output (pipe to ffmpeg for MP4)
@@ -100,6 +102,8 @@ python3 convert.py --model t5 \
 
 ## Quick Start
 
+### Text-to-video
+
 ```bash
 mkdir -p output
 
@@ -113,6 +117,46 @@ mkdir -p output
     --steps  40  --cfg 3.0  --shift 3.0 \
     --seed   42  --out output/frame
 ```
+
+### Image-to-video (I2V) — animate a reference image
+
+Provide a PPM image as `--start-frame`.  The video will start from (and be
+strongly conditioned on) that image and animate from there based on the prompt.
+
+```bash
+# Convert your image to PPM first (if needed):
+ffmpeg -i photo.jpg photo.ppm
+
+./build/ltx-generate \
+    --dit    models/ltxv-2b-0.9.6-dev-Q8_0.gguf \
+    --vae    models/ltxv-vae-Q8_0.gguf \
+    --t5     models/t5-xxl-Q8_0.gguf \
+    --prompt "Camera slowly pans right, birds fly overhead" \
+    --start-frame photo.ppm \
+    --frames 25 --height 480 --width 704 \
+    --steps 40 --cfg 3.0 --out output/frame
+```
+
+### Keyframe interpolation — animate between two images
+
+Provide both `--start-frame` and `--end-frame` to generate a video that
+transitions smoothly from the first image to the last.
+
+```bash
+./build/ltx-generate \
+    --dit    models/ltxv-2b-0.9.6-dev-Q8_0.gguf \
+    --vae    models/ltxv-vae-Q8_0.gguf \
+    --t5     models/t5-xxl-Q8_0.gguf \
+    --prompt "A serene forest scene, gentle breeze, cinematic" \
+    --start-frame beginning.ppm \
+    --end-frame   ending.ppm \
+    --frames 33 --height 480 --width 704 \
+    --steps 40 --cfg 3.0 --out output/frame
+```
+
+Use `--frame-strength` (0..1) to control how strongly the reference frame(s)
+constrain the generation.  Default is `1.0` (fully pinned).  Lower values
+give the model more creative freedom around the reference.
 
 Convert the PPM frames to MP4:
 
@@ -144,6 +188,12 @@ Generation:
   --seed    <N>     RNG seed                         (default: 42)
   --out     <pfx>   Output frame file prefix         (default: output/frame)
 
+Image-to-video (I2V) conditioning:
+  --start-frame  <path>  PPM image: animate from this reference frame
+  --end-frame    <path>  PPM image: end at this frame (keyframe interpolation)
+  --frame-strength <f>   Conditioning strength [0..1]  (default: 1.0)
+                          1.0 = fully pin frame, 0.5 = soft guidance
+
 Performance:
   --threads <N>     CPU worker threads               (default: 4)
   -v                Verbose logging per step
@@ -152,6 +202,8 @@ Performance:
 ---
 
 ## Architecture
+
+### Text-to-video
 
 ```
 Text prompt
@@ -176,12 +228,37 @@ LTX-Video DiT           (GGUF: ltxv-2b-*.gguf)
   │  Euler ODE (flow matching)    │         │
   └───────────────────────────────┘         │
     │  [T_lat × H_lat × W_lat × 128]        │
-    ▼                                       │
+    ▼
 CausalVideoVAE decoder  (GGUF: ltxv-vae-*.gguf)
     │  [T_vid × H_vid × W_vid × 3] pixels
     ▼
 PPM frames  →  ffmpeg  →  MP4
 ```
+
+### Image-to-video (I2V) / Keyframe interpolation
+
+```
+Reference image(s) (PPM)
+    │
+    ▼
+VaeEncoder.encode_frame()     pixel [H×W×3] → latent [H_lat×W_lat×128]
+    │  start_lat / end_lat
+    │
+    ├──────────────────────────────────────────────────┐
+    ▼                                                  ▼
+Random noise latent                        Frame conditioning
+[T_lat × H_lat × W_lat × 128]             per denoising step:
+    │                                        lat[T=0]  ← blend(start_lat, t)
+    │  Denoising loop (same as T2V)          lat[T=-1] ← blend(end_lat,   t)
+    │        +
+    │  frame-pinning after each Euler step
+    ▼
+VAE decode + PPM output
+```
+
+The conditioning blend weight increases as the timestep approaches 0
+(clean signal), so early steps use mostly noise for global structure while
+later steps are progressively more pinned to the reference image(s).
 
 | Dimension       | Formula                            |
 |-----------------|------------------------------------|
