@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+*.dylib
+
+# Model files (large binaries – download separately)
+models/
+checkpoints/
+
+# Output frames
+output/
+*.ppm
+*.mp4
+*.wav
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
