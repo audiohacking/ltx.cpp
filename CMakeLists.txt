@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(ltx.cpp VERSION 0.1.0 LANGUAGES CXX C)
 
+include(CheckCXXCompilerFlag)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -41,9 +43,15 @@ target_link_libraries(ltx-generate PRIVATE ltx_common)
 if(MSVC)
     target_compile_options(ltx-generate PRIVATE /W3)
 else()
-    target_compile_options(ltx-generate PRIVATE -Wall -Wextra -Wno-unused-parameter
-        # stb_image.h is a vendored third-party header; suppress its warnings.
-        -Wno-unused-but-set-variable)
+    # -Wno-unused-but-set-variable suppresses warnings from vendored stb_image.h.
+    # The flag is supported by GCC and Apple Clang 13+; guard it so older
+    # toolchains don't fail with an "unrecognized option" error.
+    check_cxx_compiler_flag(-Wno-unused-but-set-variable HAS_WNO_UNUSED_BUT_SET_VARIABLE)
+    set(_ltx_generate_warn_flags -Wall -Wextra -Wno-unused-parameter)
+    if(HAS_WNO_UNUSED_BUT_SET_VARIABLE)
+        list(APPEND _ltx_generate_warn_flags -Wno-unused-but-set-variable)
+    endif()
+    target_compile_options(ltx-generate PRIVATE ${_ltx_generate_warn_flags})
 endif()
 
 # ── quantize utility ─────────────────────────────────────────────────────────

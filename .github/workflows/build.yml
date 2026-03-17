@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure (CMake – CPU only, Release)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLTX_CUDA=OFF \
+            -DLTX_VULKAN=OFF \
+            -DLTX_METAL=OFF \
+            -DLTX_HIP=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify binaries exist
+        run: |
+          test -f build/ltx-generate  || test -f build/Release/ltx-generate
+          test -f build/ltx-quantize  || test -f build/Release/ltx-quantize
