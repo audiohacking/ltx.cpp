@@ -79,8 +79,8 @@ static void print_usage(const char * prog) {
         "  --out     <pfx>   Output frame prefix (default: output/frame)\n"
         "\n"
         "Image-to-video (I2V) conditioning:\n"
-        "  --start-frame <path>  PPM image to use as the first frame / reference\n"
-        "  --end-frame   <path>  PPM image to use as the last frame (keyframe interp)\n"
+        "  --start-frame <path>  PNG/JPG/BMP/TGA/PPM image to use as the first frame / reference\n"
+        "  --end-frame   <path>  PNG/JPG/BMP/TGA/PPM image to use as the last frame (keyframe interp)\n"
         "  --frame-strength <f> Conditioning strength [0..1] (default: 1.0)\n"
         "                        1.0 = fully pin the frame, 0.0 = no conditioning\n"
         "\n"
@@ -224,7 +224,7 @@ int main(int argc, char ** argv) {
 
     if (has_start) {
         LTX_LOG("loading start frame: %s", args.start_frame_path.c_str());
-        VideoBuffer img = load_ppm(args.start_frame_path);
+        VideoBuffer img = load_image(args.start_frame_path);
         if (img.frames == 0) return 1;
         start_lat = vae_enc.encode_frame(img.frame(0),
             img.height, img.width, H_lat, W_lat);
@@ -233,7 +233,7 @@ int main(int argc, char ** argv) {
 
     if (has_end) {
         LTX_LOG("loading end frame: %s", args.end_frame_path.c_str());
-        VideoBuffer img = load_ppm(args.end_frame_path);
+        VideoBuffer img = load_image(args.end_frame_path);
         if (img.frames == 0) return 1;
         end_lat = vae_enc.encode_frame(img.frame(0),
             img.height, img.width, H_lat, W_lat);
@@ -305,17 +305,17 @@ int main(int argc, char ** argv) {
         // ── Frame conditioning: pin start / end latent frames ──────────────
         // After each Euler step we re-impose the reference frame(s) to prevent
         // the denoising process from drifting away from the conditioning.
-        // The blend weight fades from 1 (at t=1, pure noise) to frame_strength
-        // at t=0, so early steps see more noise-mixing and later steps are
-        // progressively more pinned to the reference.
+        // Blend weight increases linearly from 0 (at t=1, pure noise) to
+        // frame_strength (at t=0, clean image), so early steps allow global
+        // structure to form freely while later steps are progressively more
+        // pinned to the reference frame.
         //
-        //   blend = frame_strength * (1 - t_next)
+        //   blend = frame_strength * (1 - t_next)   ∈ [0, frame_strength]
         //   lat_frame = lat_frame * (1 - blend) + ref_lat * blend
         //
-        // This is a simple linear conditioning schedule that works without
-        // modifying the DiT architecture.
+        // This approach requires no modifications to the DiT architecture.
         if ((has_start || has_end) && args.frame_strength > 0.0f) {
-            // blend weight increases as t_next approaches 0.
+            // Blend increases as t_next approaches 0 (clean image).
             float blend = args.frame_strength * (1.0f - t_next);
             blend = std::max(0.0f, std::min(1.0f, blend));
 

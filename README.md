@@ -120,19 +120,18 @@ mkdir -p output
 
 ### Image-to-video (I2V) — animate a reference image
 
-Provide a PPM image as `--start-frame`.  The video will start from (and be
-strongly conditioned on) that image and animate from there based on the prompt.
+Provide a **PNG, JPG, BMP, TGA, or PPM** image as `--start-frame`.  The video will
+start from (and be strongly conditioned on) that image and animate from there
+based on the prompt.  No conversion step is needed — standard image formats are
+supported natively.
 
 ```bash
-# Convert your image to PPM first (if needed):
-ffmpeg -i photo.jpg photo.ppm
-
 ./build/ltx-generate \
     --dit    models/ltxv-2b-0.9.6-dev-Q8_0.gguf \
     --vae    models/ltxv-vae-Q8_0.gguf \
     --t5     models/t5-xxl-Q8_0.gguf \
     --prompt "Camera slowly pans right, birds fly overhead" \
-    --start-frame photo.ppm \
+    --start-frame photo.jpg \
     --frames 25 --height 480 --width 704 \
     --steps 40 --cfg 3.0 --out output/frame
 ```
@@ -148,8 +147,8 @@ transitions smoothly from the first image to the last.
     --vae    models/ltxv-vae-Q8_0.gguf \
     --t5     models/t5-xxl-Q8_0.gguf \
     --prompt "A serene forest scene, gentle breeze, cinematic" \
-    --start-frame beginning.ppm \
-    --end-frame   ending.ppm \
+    --start-frame beginning.png \
+    --end-frame   ending.png \
     --frames 33 --height 480 --width 704 \
     --steps 40 --cfg 3.0 --out output/frame
 ```
@@ -158,7 +157,10 @@ Use `--frame-strength` (0..1) to control how strongly the reference frame(s)
 constrain the generation.  Default is `1.0` (fully pinned).  Lower values
 give the model more creative freedom around the reference.
 
-Convert the PPM frames to MP4:
+**Supported input image formats:** PNG, JPEG/JPG, BMP, TGA, PPM/PGM
+(powered by stb_image — no additional libraries required)
+
+Convert the PPM output frames to MP4:
 
 ```bash
 ffmpeg -framerate 24 -i output/frame_%04d.ppm -c:v libx264 -pix_fmt yuv420p output.mp4
@@ -189,8 +191,8 @@ Generation:
   --out     <pfx>   Output frame file prefix         (default: output/frame)
 
 Image-to-video (I2V) conditioning:
-  --start-frame  <path>  PPM image: animate from this reference frame
-  --end-frame    <path>  PPM image: end at this frame (keyframe interpolation)
+  --start-frame  <path>  PNG/JPG/BMP/TGA/PPM image: animate from this reference frame
+  --end-frame    <path>  PNG/JPG/BMP/TGA/PPM image: end at this frame (keyframe interp)
   --frame-strength <f>   Conditioning strength [0..1]  (default: 1.0)
                           1.0 = fully pin frame, 0.5 = soft guidance
 

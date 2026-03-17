@@ -264,19 +264,22 @@ private:
             }
         } else {
             // Fallback: naive channel-to-RGB mapping.
+            // Averages C/3 channels per colour.  The third group gets the
+            // remainder (C - 2*third) channels; guard against divide-by-zero
+            // when C < 3 (unlikely in practice but defensive).
             for (int h = 0; h < H; ++h)
             for (int w = 0; w < W; ++w) {
                 const float * x = lat + (h * W + w) * C;
                 float * p = pix.data() + (h * W + w) * 3;
-                // Use mean of groups of channels as rough colour signal.
                 float r = 0, g = 0, b = 0;
-                int third = C / 3;
+                int third      = std::max(1, C / 3);
+                int blue_count = std::max(1, C - 2 * third);
                 for (int c = 0; c < third; ++c)        r += x[c];
                 for (int c = third; c < 2*third; ++c)  g += x[c];
                 for (int c = 2*third; c < C; ++c)      b += x[c];
                 p[0] = std::tanh(r / third);
                 p[1] = std::tanh(g / third);
-                p[2] = std::tanh(b / (C - 2*third));
+                p[2] = std::tanh(b / blue_count);
             }
         }
         return pix;
@@ -378,10 +381,9 @@ struct VaeEncoder {
             }
         } else {
             // Pseudo-encoding: tile the 3-channel normalized pixel across C
-            // channels with a simple scale factor that places values in a
-            // typical latent magnitude range (~N(0,1)).
-            // Each group of C/3 channels is assigned one colour channel.
-            int third = C / 3;
+            // channels, assigning one colour channel per third of the latent.
+            // Guard against divide-by-zero when C < 3.
+            int third = std::max(1, C / 3);
             for (int h = 0; h < H_lat; ++h)
             for (int w = 0; w < W_lat; ++w) {
                 const float * pix = norm.data() + (h * W_lat + w) * 3;

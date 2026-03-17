@@ -41,7 +41,9 @@ target_link_libraries(ltx-generate PRIVATE ltx_common)
 if(MSVC)
     target_compile_options(ltx-generate PRIVATE /W3)
 else()
-    target_compile_options(ltx-generate PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_compile_options(ltx-generate PRIVATE -Wall -Wextra -Wno-unused-parameter
+        # stb_image.h is a vendored third-party header; suppress its warnings.
+        -Wno-unused-but-set-variable)
 endif()
 
 # ── quantize utility ─────────────────────────────────────────────────────────

@@ -164,75 +164,39 @@ static void write_video_frames(const VideoBuffer & vbuf, const std::string & out
     LTX_LOG("wrote %d PPM frames with prefix '%s'", vbuf.frames, out_prefix.c_str());
 }
 
-// ── PPM image reader ─────────────────────────────────────────────────────────
+// ── Image loading (PNG / JPG / BMP / TGA / PPM / …) ─────────────────────────
 //
-// Supports binary PPM (P6) and ASCII PPM (P5/P6).
-// Returns raw uint8 RGB pixels in a VideoBuffer with frames=1.
-// On failure returns an empty VideoBuffer (frames=0).
+// Uses stb_image (vendored in src/stb_image.h, public domain) to decode
+// any common image format into 8-bit RGB.
+// Returns a VideoBuffer with frames=1 on success, frames=0 on failure.
 
-static VideoBuffer load_ppm(const std::string & path) {
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) {
-        LTX_ERR("cannot open image: %s", path.c_str());
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_BMP
+#define STBI_ONLY_TGA
+#define STBI_ONLY_PNM   // PPM / PGM / PBM
+#define STBI_NO_GIF
+#define STBI_NO_PSD
+#define STBI_NO_HDR
+#define STBI_NO_PIC
+#define STBI_FAILURE_USERMSG
+#include "stb_image.h"
+
+static VideoBuffer load_image(const std::string & path) {
+    int W = 0, H = 0, channels = 0;
+    // Force 3 output channels (RGB) regardless of source format.
+    uint8_t * data = stbi_load(path.c_str(), &W, &H, &channels, 3);
+    if (!data) {
+        LTX_ERR("failed to load image '%s': %s", path.c_str(), stbi_failure_reason());
         return VideoBuffer(0, 0, 0);
     }
-
-    auto skip_ws_comments = [&]() {
-        int c;
-        while ((c = fgetc(f)) != EOF) {
-            if (c == '#') { while ((c = fgetc(f)) != EOF && c != '\n') {} }
-            else if (c != ' ' && c != '\t' && c != '\n' && c != '\r') { ungetc(c, f); break; }
-        }
-    };
-
-    char magic[3] = {};
-    if (fread(magic, 1, 2, f) != 2 || magic[0] != 'P' || (magic[1] != '6' && magic[1] != '3')) {
-        LTX_ERR("unsupported image format (only P6 binary PPM supported): %s", path.c_str());
-        fclose(f);
-        return VideoBuffer(0, 0, 0);
-    }
-    bool binary = (magic[1] == '6');
-
-    skip_ws_comments();
-    int W = 0, H = 0, maxval = 0;
-    if (fscanf(f, "%d", &W) != 1 || W <= 0) { fclose(f); return VideoBuffer(0, 0, 0); }
-    skip_ws_comments();
-    if (fscanf(f, "%d", &H) != 1 || H <= 0) { fclose(f); return VideoBuffer(0, 0, 0); }
-    skip_ws_comments();
-    if (fscanf(f, "%d", &maxval) != 1 || maxval <= 0) { fclose(f); return VideoBuffer(0, 0, 0); }
-    // Consume exactly one whitespace character after maxval.
-    (void)fgetc(f);
 
     VideoBuffer buf(1, H, W);
-    uint8_t * dst = buf.frame(0);
+    memcpy(buf.frame(0), data, (size_t)W * H * 3);
+    stbi_image_free(data);
 
-    if (binary) {
-        size_t npix = (size_t)W * H * 3;
-        if (maxval <= 255) {
-            if (fread(dst, 1, npix, f) != npix) {
-                LTX_ERR("truncated PPM: %s", path.c_str());
-                fclose(f);
-                return VideoBuffer(0, 0, 0);
-            }
-        } else {
-            // 16-bit PPM: read big-endian uint16 and scale to uint8.
-            for (size_t i = 0; i < npix; ++i) {
-                int hi = fgetc(f), lo = fgetc(f);
-                if (hi == EOF || lo == EOF) break;
-                dst[i] = (uint8_t)(((hi << 8) | lo) * 255 / maxval);
-            }
-        }
-    } else {
-        // ASCII PPM (P3).
-        for (int i = 0; i < W * H * 3; ++i) {
-            int v = 0;
-            if (fscanf(f, "%d", &v) != 1) break;
-            dst[i] = (uint8_t)(v * 255 / maxval);
-        }
-    }
-
-    fclose(f);
-    LTX_LOG("loaded PPM: %s (%dx%d)", path.c_str(), W, H);
+    LTX_LOG("loaded image: %s (%dx%d, original channels=%d)", path.c_str(), W, H, channels);
     return buf;
 }
 
