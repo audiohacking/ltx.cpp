@@ -21,8 +21,9 @@
 
 #include "ltx_common.hpp"
 #include <cmath>
-#include <cstdio>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 
 // Returns scratch size in bytes: up to 90% of system RAM (min 1 GB). Implemented in ltx-generate.cpp to avoid pulling sys/param.h on macOS.
 size_t dit_scratch_size_bytes();
@@ -338,6 +339,7 @@ struct LtxDiT {
     //   seq_len:       text sequence length
     //   scratch_buf:   persistent buffer for ggml (reused each call; use dit_scratch_size_bytes()).
     //   scratch_size: size of scratch_buf in bytes.
+    //   backend:       optional GGML backend (from ggml_backend_init_best()); if non-null, inference runs on backend (e.g. Metal/CUDA).
     //
     // Returns predicted noise/velocity: [N_tok × patch_dim]
     // Chunked (pre → each block → post), same scratch_buf reused; peak ~20 GB like ComfyUI.
@@ -345,7 +347,8 @@ struct LtxDiT {
             const float * latents,   int n_tok,
             const float * text_emb,  int seq_len,
             float timestep,
-            void * scratch_buf, size_t scratch_size) const
+            void * scratch_buf, size_t scratch_size,
+            ggml_backend_t backend = nullptr) const
     {
         (void)timestep;
         if (!scratch_buf || scratch_size == 0) { LTX_ERR("DiT forward: scratch_buf and scratch_size required"); return {}; }
@@ -361,13 +364,29 @@ struct LtxDiT {
             return ggml_cont(ctx, ggml_transpose(ctx, W));
         };
 
-        struct ggml_init_params params = { scratch_size, scratch_buf, false };
+        struct ggml_init_params params;
+        ggml_gallocr_t galloc = nullptr;
+        if (backend) {
+            galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!galloc) return {};
+            static const size_t LTX_DIT_MAX_GRAPH_NODES = 8192;
+            static size_t no_alloc_size = 0;
+            static std::vector<uint8_t> no_alloc_buf;
+            if (no_alloc_buf.empty()) {
+                no_alloc_size = ggml_tensor_overhead() * LTX_DIT_MAX_GRAPH_NODES + ggml_graph_overhead_custom(LTX_DIT_MAX_GRAPH_NODES, false);
+                no_alloc_buf.resize(no_alloc_size);
+            }
+            params = { no_alloc_size, no_alloc_buf.data(), true };
+        } else {
+            params = { scratch_size, scratch_buf, false };
+        }
 
         // ── Pre: patch_embed + cap_proj ───────────────────────────────────────
         struct ggml_context * ctx = ggml_init(params);
-        if (!ctx) { LTX_ERR("DiT: ggml_init failed"); return {}; }
-        struct ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Pd, n_tok);
-        memcpy(x->data, latents, (size_t)n_tok * Pd * sizeof(float));
+        if (!ctx) { LTX_ERR("DiT: ggml_init failed"); if (galloc) ggml_gallocr_free(galloc); return {}; }
+        struct ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Pd, n_tok);
+        struct ggml_tensor * x = x_in;
+        if (!backend) memcpy(x->data, latents, (size_t)n_tok * Pd * sizeof(float));
         if (patch_embed_w) {
             x = ggml_mul_mat(ctx, w_for_mul(ctx, patch_embed_w, x), x);
             x = ggml_cont(ctx, x);
@@ -377,8 +396,9 @@ struct LtxDiT {
                 x = ggml_add(ctx, x, b2);
             }
         }
-        struct ggml_tensor * ctx_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Cd, seq_len);
-        memcpy(ctx_emb->data, text_emb, (size_t)seq_len * Cd * sizeof(float));
+        struct ggml_tensor * ctx_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Cd, seq_len);
+        struct ggml_tensor * ctx_emb = ctx_emb_in;
+        if (!backend) memcpy(ctx_emb->data, text_emb, (size_t)seq_len * Cd * sizeof(float));
         if (cap_proj_w) {
             ctx_emb = ggml_mul_mat(ctx, w_for_mul(ctx, cap_proj_w, ctx_emb), ctx_emb);
             ctx_emb = ggml_cont(ctx, ctx_emb);
@@ -391,12 +411,21 @@ struct LtxDiT {
         struct ggml_cgraph * gf_pre = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf_pre, x);
         ggml_build_forward_expand(gf_pre, ctx_emb);
-        ggml_graph_compute_with_ctx(ctx, gf_pre, 4);
         std::vector<float> x_host((size_t)D * n_tok);
         std::vector<float> ctx_emb_host((size_t)D * seq_len);
-        memcpy(x_host.data(), x->data, (size_t)D * n_tok * sizeof(float));
-        memcpy(ctx_emb_host.data(), ctx_emb->data, (size_t)D * seq_len * sizeof(float));
-        ggml_free(ctx);
+        if (backend) {
+            if (!ggml_gallocr_alloc_graph(galloc, gf_pre)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+            ggml_backend_tensor_set(x_in, latents, 0, (size_t)n_tok * Pd * sizeof(float));
+            ggml_backend_tensor_set(ctx_emb_in, text_emb, 0, (size_t)seq_len * Cd * sizeof(float));
+            if (ggml_backend_graph_compute(backend, gf_pre) != GGML_STATUS_SUCCESS) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+            ggml_backend_tensor_get(x, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
+            ggml_backend_tensor_get(ctx_emb, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
+        } else {
+            ggml_graph_compute_with_ctx(ctx, gf_pre, 4);
+            memcpy(x_host.data(), x->data, (size_t)D * n_tok * sizeof(float));
+            memcpy(ctx_emb_host.data(), ctx_emb->data, (size_t)D * seq_len * sizeof(float));
+        }
+        if (backend) ggml_free(ctx); else ggml_reset(ctx);
 
         // Query chunk size to avoid materializing n_tok×n_tok attention (ComfyUI uses flash/memory-efficient attn).
         // kq is (Dh,Nkv,chunk) = 128*36960*chunk*4 bytes; 256 -> ~4.8 GB, with soft_max copy fits in 21 GB.
@@ -425,8 +454,7 @@ struct LtxDiT {
         {
             if (out_host && q_src_host && Nq > ATTN_Q_CHUNK && Nkv == Nq) {
                 // Chunked self-attention: K,V once, then Q in chunks (avoids n_tok×n_tok matrix).
-                ctx = ggml_init(params);
-                if (!ctx) return nullptr;
+                if (backend) { ctx = ggml_init(params); if (!ctx) return nullptr; }
                 struct ggml_tensor * k = proj_3d(ctx, Wk, bk, kv_src, Nkv);
                 struct ggml_tensor * v = proj_3d(ctx, Wv, bv, kv_src, Nkv);
                 k = ggml_permute(ctx, k, 0, 2, 1, 3);
@@ -436,29 +464,37 @@ struct LtxDiT {
                 struct ggml_cgraph * gkv = ggml_new_graph(ctx);
                 ggml_build_forward_expand(gkv, k);
                 ggml_build_forward_expand(gkv, v);
-                ggml_graph_compute_with_ctx(ctx, gkv, 4);
                 std::vector<float> k_host((size_t)Dh * Nkv * H);
                 std::vector<float> v_host((size_t)Dh * Nkv * H);
-                memcpy(k_host.data(), k->data, k_host.size() * sizeof(float));
-                memcpy(v_host.data(), v->data, v_host.size() * sizeof(float));
-                ggml_free(ctx);
+                if (backend) {
+                    if (!ggml_gallocr_alloc_graph(galloc, gkv)) { ggml_free(ctx); return nullptr; }
+                    if (ggml_backend_graph_compute(backend, gkv) != GGML_STATUS_SUCCESS) { ggml_free(ctx); return nullptr; }
+                    ggml_backend_tensor_get(k, k_host.data(), 0, k_host.size() * sizeof(float));
+                    ggml_backend_tensor_get(v, v_host.data(), 0, v_host.size() * sizeof(float));
+                } else {
+                    ggml_graph_compute_with_ctx(ctx, gkv, 4);
+                    memcpy(k_host.data(), k->data, k_host.size() * sizeof(float));
+                    memcpy(v_host.data(), v->data, v_host.size() * sizeof(float));
+                }
+                if (backend) ggml_free(ctx); else ggml_reset(ctx);
 
                 for (int start = 0; start < Nq; start += ATTN_Q_CHUNK) {
                     int len = (start + ATTN_Q_CHUNK <= Nq) ? ATTN_Q_CHUNK : (Nq - start);
-                    ctx = ggml_init(params);
-                    if (!ctx) return nullptr;
+                    if (backend) { ctx = ggml_init(params); if (!ctx) return nullptr; }
                     struct ggml_tensor * q_src_chunk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, len);
-                    memcpy(q_src_chunk->data, q_src_host + (size_t)start * D, (size_t)len * D * sizeof(float));
+                    if (!backend) memcpy(q_src_chunk->data, q_src_host + (size_t)start * D, (size_t)len * D * sizeof(float));
                     struct ggml_tensor * q_chunk = proj_3d(ctx, Wq, bq, q_src_chunk, len);
                     q_chunk = ggml_permute(ctx, q_chunk, 0, 2, 1, 3);
                     q_chunk = ggml_cont(ctx, q_chunk);
                     struct ggml_tensor * k_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Dh, Nkv, H);
                     struct ggml_tensor * v_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Nkv, Dh, H);
-                    memcpy(k_t->data, k_host.data(), k_host.size() * sizeof(float));
-                    for (int64_t i = 0; i < Nkv; ++i)
-                        for (int64_t j = 0; j < Dh; ++j)
-                            for (int h = 0; h < H; ++h)
-                                ((float *)v_t->data)[(i * Dh + j) * H + h] = ((const float *)v_host.data())[(h * Nkv + i) * Dh + j];
+                    if (!backend) {
+                        memcpy(k_t->data, k_host.data(), k_host.size() * sizeof(float));
+                        for (int64_t i = 0; i < Nkv; ++i)
+                            for (int64_t j = 0; j < Dh; ++j)
+                                for (int h = 0; h < H; ++h)
+                                    ((float *)v_t->data)[(i * Dh + j) * H + h] = ((const float *)v_host.data())[(h * Nkv + i) * Dh + j];
+                    }
                     struct ggml_tensor * kq = ggml_mul_mat(ctx, k_t, q_chunk);
                     kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float)Dh));
                     kq = ggml_soft_max(ctx, kq);
@@ -477,9 +513,23 @@ struct LtxDiT {
                     }
                     struct ggml_cgraph * gch = ggml_new_graph(ctx);
                     ggml_build_forward_expand(gch, out_c);
-                    ggml_graph_compute_with_ctx(ctx, gch, 4);
-                    memcpy(out_host + (size_t)start * D, out_c->data, (size_t)len * D * sizeof(float));
-                    ggml_free(ctx);
+                    if (backend) {
+                        if (!ggml_gallocr_alloc_graph(galloc, gch)) { ggml_free(ctx); return nullptr; }
+                        ggml_backend_tensor_set(q_src_chunk, q_src_host + (size_t)start * D, 0, (size_t)len * D * sizeof(float));
+                        ggml_backend_tensor_set(k_t, k_host.data(), 0, k_host.size() * sizeof(float));
+                        std::vector<float> v_t_layout((size_t)Nkv * Dh * H);
+                        for (int64_t i = 0; i < Nkv; ++i)
+                            for (int64_t j = 0; j < Dh; ++j)
+                                for (int h = 0; h < H; ++h)
+                                    v_t_layout[(size_t)((i * Dh + j) * H + h)] = v_host.data()[(size_t)((h * Nkv + i) * Dh + j)];
+                        ggml_backend_tensor_set(v_t, v_t_layout.data(), 0, v_t_layout.size() * sizeof(float));
+                        if (ggml_backend_graph_compute(backend, gch) != GGML_STATUS_SUCCESS) { ggml_free(ctx); return nullptr; }
+                        ggml_backend_tensor_get(out_c, out_host + (size_t)start * D, 0, (size_t)len * D * sizeof(float));
+                    } else {
+                        ggml_graph_compute_with_ctx(ctx, gch, 4);
+                        memcpy(out_host + (size_t)start * D, out_c->data, (size_t)len * D * sizeof(float));
+                    }
+                    if (backend) ggml_free(ctx); else ggml_reset(ctx);
                 }
                 return nullptr;
             }
@@ -513,14 +563,15 @@ struct LtxDiT {
         // ── Blocks: one context per block, same scratch buffer ─────────────────
         for (int li = 0; li < cfg.num_layers; ++li) {
             const auto & B = blocks[li];
-            ctx = ggml_init(params);
-            if (!ctx) { LTX_ERR("DiT: block ggml_init failed"); return {}; }
+            if (backend) { ctx = ggml_init(params); if (!ctx) { LTX_ERR("DiT: block ggml_init failed"); return {}; } }
             struct ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-            memcpy(x_in->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
+            if (!backend) memcpy(x_in->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
             struct ggml_tensor * ctx_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, seq_len);
-            memcpy(ctx_emb_in->data, ctx_emb_host.data(), (size_t)D * seq_len * sizeof(float));
+            if (!backend) memcpy(ctx_emb_in->data, ctx_emb_host.data(), (size_t)D * seq_len * sizeof(float));
 
             struct ggml_tensor * h = x_in;
+            struct ggml_tensor * blk_x_in = x_in;
+            struct ggml_tensor * blk_sa_extra = nullptr;
             std::vector<float> sa_out_host((size_t)D * n_tok);
             std::vector<float> nx_host;
             struct ggml_tensor * nx = h;
@@ -532,9 +583,18 @@ struct LtxDiT {
             if (n_tok > ATTN_Q_CHUNK) {
                 struct ggml_cgraph * gnx = ggml_new_graph(ctx);
                 ggml_build_forward_expand(gnx, nx);
-                ggml_graph_compute_with_ctx(ctx, gnx, 4);
                 nx_host.resize((size_t)D * n_tok);
-                memcpy(nx_host.data(), nx->data, (size_t)D * n_tok * sizeof(float));
+                if (backend) {
+                    if (!ggml_gallocr_alloc_graph(galloc, gnx)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+                    ggml_backend_tensor_set(x_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
+                    ggml_backend_tensor_set(ctx_emb_in, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
+                    if (ggml_backend_graph_compute(backend, gnx) != GGML_STATUS_SUCCESS) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+                    ggml_backend_tensor_get(nx, nx_host.data(), 0, (size_t)D * n_tok * sizeof(float));
+                } else {
+                    ggml_graph_compute_with_ctx(ctx, gnx, 4);
+                    memcpy(nx_host.data(), nx->data, (size_t)D * n_tok * sizeof(float));
+                    ggml_reset(ctx);
+                }
                 q_src_host_ptr = nx_host.data();
             }
             struct ggml_tensor * sa_out = attn(ctx, nx, nx, n_tok, n_tok,
@@ -544,16 +604,16 @@ struct LtxDiT {
             if (sa_out) {
                 h = ggml_add(ctx, h, ggml_cont(ctx, sa_out));
             } else {
-                ggml_free(ctx);
-                ctx = ggml_init(params);
-                if (!ctx) { LTX_ERR("DiT: block ctx after chunked attn failed"); return {}; }
+                if (backend) { ggml_free(ctx); ctx = ggml_init(params); if (!ctx) { LTX_ERR("DiT: block ctx after chunked attn failed"); return {}; } } else ggml_reset(ctx);
                 struct ggml_tensor * x_in2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-                memcpy(x_in2->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
+                if (!backend) memcpy(x_in2->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
                 struct ggml_tensor * sa_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-                memcpy(sa_t->data, sa_out_host.data(), (size_t)D * n_tok * sizeof(float));
+                if (!backend) memcpy(sa_t->data, sa_out_host.data(), (size_t)D * n_tok * sizeof(float));
                 h = ggml_add(ctx, x_in2, sa_t);
+                blk_x_in = x_in2;
+                blk_sa_extra = sa_t;
                 ctx_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, seq_len);
-                memcpy(ctx_emb_in->data, ctx_emb_host.data(), (size_t)D * seq_len * sizeof(float));
+                if (!backend) memcpy(ctx_emb_in->data, ctx_emb_host.data(), (size_t)D * seq_len * sizeof(float));
             }
 
             struct ggml_tensor * cx = h;
@@ -596,16 +656,25 @@ struct LtxDiT {
             }
             struct ggml_cgraph * gf_blk = ggml_new_graph(ctx);
             ggml_build_forward_expand(gf_blk, h);
-            ggml_graph_compute_with_ctx(ctx, gf_blk, 4);
-            memcpy(x_host.data(), h->data, (size_t)D * n_tok * sizeof(float));
-            ggml_free(ctx);
+            if (backend) {
+                if (!ggml_gallocr_alloc_graph(galloc, gf_blk)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+                ggml_backend_tensor_set(blk_x_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
+                ggml_backend_tensor_set(ctx_emb_in, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
+                if (blk_sa_extra) ggml_backend_tensor_set(blk_sa_extra, sa_out_host.data(), 0, (size_t)D * n_tok * sizeof(float));
+                if (ggml_backend_graph_compute(backend, gf_blk) != GGML_STATUS_SUCCESS) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+                ggml_backend_tensor_get(h, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
+            } else {
+                ggml_graph_compute_with_ctx(ctx, gf_blk, 4);
+                memcpy(x_host.data(), h->data, (size_t)D * n_tok * sizeof(float));
+            }
+            if (backend) ggml_free(ctx); else ggml_reset(ctx);
         }
 
         // ── Post: final norm + proj_out ───────────────────────────────────────
-        ctx = ggml_init(params);
-        if (!ctx) { LTX_ERR("DiT: post ggml_init failed"); return {}; }
-        struct ggml_tensor * x_fin = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-        memcpy(x_fin->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
+        if (backend) { ctx = ggml_init(params); if (!ctx) { LTX_ERR("DiT: post ggml_init failed"); return {}; } }
+        struct ggml_tensor * x_fin_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
+        struct ggml_tensor * x_fin = x_fin_in;
+        if (!backend) memcpy(x_fin->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
         if (final_norm_w) {
             x_fin = ggml_rms_norm(ctx, x_fin, cfg.norm_eps);
             x_fin = ggml_mul(ctx, x_fin, final_norm_w);
@@ -621,10 +690,19 @@ struct LtxDiT {
         }
         struct ggml_cgraph * gf_post = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf_post, x_fin);
-        ggml_graph_compute_with_ctx(ctx, gf_post, 4);
         std::vector<float> out((size_t)n_tok * Pd);
-        memcpy(out.data(), x_fin->data, (size_t)n_tok * Pd * sizeof(float));
+        if (backend) {
+            if (!ggml_gallocr_alloc_graph(galloc, gf_post)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+            ggml_backend_tensor_set(x_fin_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
+            if (ggml_backend_graph_compute(backend, gf_post) != GGML_STATUS_SUCCESS) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
+            ggml_backend_tensor_get(x_fin, out.data(), 0, (size_t)n_tok * Pd * sizeof(float));
+        } else {
+            ggml_graph_compute_with_ctx(ctx, gf_post, 4);
+            memcpy(out.data(), x_fin->data, (size_t)n_tok * Pd * sizeof(float));
+        }
         ggml_free(ctx);
+        ctx = nullptr;
+        if (galloc) ggml_gallocr_free(galloc);
         return out;
     }
 };

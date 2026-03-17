@@ -40,7 +40,7 @@
 #  include <sys/sysinfo.h>
 #endif
 
-// Up to 90% of system RAM for DiT scratch (min 1 GB). Avoids pulling sys/param.h in the header on macOS.
+// Up to 85% of system RAM for DiT scratch (min 1 GB). Avoids pulling sys/param.h in the header on macOS.
 size_t dit_scratch_size_bytes() {
     size_t total_bytes = 0;
 #if defined(__APPLE__)
@@ -56,9 +56,9 @@ size_t dit_scratch_size_bytes() {
 #endif
     if (total_bytes == 0)
         return (size_t)8 * 1024 * 1024 * 1024; // fallback 8 GB
-    size_t ninety = (size_t)((double)total_bytes * 0.9);
+    size_t max_scratch = (size_t)((double)total_bytes * 0.85);
     size_t min_scratch = (size_t)1 * 1024 * 1024 * 1024; // at least 1 GB
-    return ninety > min_scratch ? ninety : min_scratch;
+    return max_scratch > min_scratch ? max_scratch : min_scratch;
 }
 
 // ── Image loading (single TU to avoid duplicate stb symbols) ─────────────────
@@ -272,6 +272,23 @@ int main(int argc, char ** argv) {
     LtxDiT dit;
     if (!dit.load(dit_model)) return 1;
 
+    // ── Backend (GGML abstraction: best available GPU or CPU) ───────────────
+    ggml_backend_t backend = ggml_backend_init_best();
+    if (!backend) backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    std::vector<ggml_backend_buffer_t> dit_weight_buffers;
+    if (backend) {
+        LTX_LOG("backend: %s", ggml_backend_name(backend));
+        int n_bufs = ltx_backend_migrate_ctx(dit_model.ggml_ctx, backend, dit_weight_buffers);
+        if (n_bufs > 0) {
+            size_t total_mb = 0;
+            for (ggml_backend_buffer_t b : dit_weight_buffers) total_mb += ggml_backend_buffer_get_size(b) / (1024 * 1024);
+            LTX_LOG("DiT weights on backend (%d buffers, %zu MB)", n_bufs, total_mb);
+        } else {
+            LTX_LOG("DiT weights could not be moved to backend, using CPU for DiT");
+            backend = nullptr;
+        }
+    }
+
     // ── Text encoding ─────────────────────────────────────────────────────────
 
     LTX_LOG("encoding prompt ...");
@@ -379,9 +396,9 @@ int main(int argc, char ** argv) {
         // Conditional velocity.
         std::vector<float> v_cond = dit.forward(
             patches.data(), n_tok, text_emb.data(), seq_len, t_cur,
-            dit_scratch_buf, dit_scratch_size);
+            dit_scratch_buf, dit_scratch_size, backend);
 
-        if (v_cond.empty()) { std::free(dit_scratch_buf); return 1; }
+        if (v_cond.empty()) { std::free(dit_scratch_buf); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (backend) ggml_backend_free(backend); return 1; }
 
         // Unpatchify velocity.
         std::vector<float> vel_cond = unpatchify(
@@ -393,8 +410,8 @@ int main(int argc, char ** argv) {
             // Unconditional velocity.
             std::vector<float> v_uncond = dit.forward(
                 patches.data(), n_tok, uncond_emb.data(), seq_len, t_cur,
-                dit_scratch_buf, dit_scratch_size);
-            if (v_uncond.empty()) { std::free(dit_scratch_buf); return 1; }
+                dit_scratch_buf, dit_scratch_size, backend);
+            if (v_uncond.empty()) { std::free(dit_scratch_buf); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (backend) ggml_backend_free(backend); return 1; }
             std::vector<float> vel_uncond = unpatchify(
                 v_uncond.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);
             RFScheduler::apply_cfg(
@@ -440,6 +457,9 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "\n");
     std::free(dit_scratch_buf);
     dit_scratch_buf = nullptr;
+    for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b);
+    dit_weight_buffers.clear();
+    if (backend) { ggml_backend_free(backend); backend = nullptr; }
 
     LTX_LOG("denoising complete, decoding with VAE ...");
 
