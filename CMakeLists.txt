@@ -7,10 +7,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
-option(LTX_CUDA    "Enable CUDA backend"   OFF)
-option(LTX_VULKAN  "Enable Vulkan backend" OFF)
-option(LTX_METAL   "Enable Metal backend"  OFF)
-option(LTX_HIP     "Enable ROCm/HIP backend" OFF)
+# Backend options: build command determines target (same pattern as acestep.cpp).
+# Defaults: Metal ON on Apple, others OFF — override with -DLTX_*=ON as needed.
+if(APPLE)
+    set(LTX_METAL_DEFAULT ON)
+else()
+    set(LTX_METAL_DEFAULT OFF)
+endif()
+option(LTX_CUDA    "Enable CUDA backend (Linux/Windows)"   OFF)
+option(LTX_VULKAN  "Enable Vulkan backend"                 OFF)
+option(LTX_METAL   "Enable Metal backend (Apple MPS)"      ${LTX_METAL_DEFAULT})
+option(LTX_HIP     "Enable ROCm/HIP backend (Linux AMD)"    OFF)
 
 # ── GGML submodule ──────────────────────────────────────────────────────────
 if(LTX_CUDA)
@@ -28,16 +35,23 @@ endif()
 
 add_subdirectory(ggml)
 
+# LTX/DiT GGUF tensor names can exceed 64 chars; allow up to 256 (must match ggml struct).
+if(NOT DEFINED GGML_MAX_NAME)
+    set(GGML_MAX_NAME 256 CACHE STRING "ggml: max tensor name length (LTX DiT needs > 64)")
+endif()
+target_compile_definitions(ggml-base PRIVATE GGML_MAX_NAME=${GGML_MAX_NAME})
+
 # ── Common interface library ─────────────────────────────────────────────────
 add_library(ltx_common INTERFACE)
 target_include_directories(ltx_common INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
 )
+target_compile_definitions(ltx_common INTERFACE GGML_MAX_NAME=${GGML_MAX_NAME})
 target_link_libraries(ltx_common INTERFACE ggml)
 
 # ── ltx-generate binary ──────────────────────────────────────────────────────
-add_executable(ltx-generate src/ltx-generate.cpp)
+add_executable(ltx-generate src/ltx-generate.cpp src/safetensors_loader.cpp)
 target_link_libraries(ltx-generate PRIVATE ltx_common)
 
 if(MSVC)

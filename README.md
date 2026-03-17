@@ -2,8 +2,7 @@
 
 Portable C++17 inference of **LTX-Video** (Lightricks) using
 [GGML](https://github.com/ggml-org/ggml) / GGUF.  
-Text-to-video generation runs on CPU, CUDA, ROCm, Metal, and Vulkan — no
-Python required at inference time.
+Text-to-video generation runs on CPU, with build-time support for CUDA, ROCm, Metal, and Vulkan (same backend-per-build pattern as [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp)). No Python at inference time.
 
 Inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp) and
 [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp).
@@ -24,28 +23,36 @@ Inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp) and
 
 ## Build
 
-```bash
-git submodule update --init          # pull ggml
+Build flags select the backend (same pattern as [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp)). One backend per build; the resulting binary is optimized for that target.
 
+```bash
+git submodule update --init
 mkdir build && cd build
 
-# CPU only
+# macOS (Metal + Accelerate BLAS auto-enabled)
 cmake ..
 
-# With NVIDIA GPU (CUDA)
+# Linux with NVIDIA GPU
 cmake .. -DLTX_CUDA=ON
 
-# With AMD GPU (ROCm)
+# Linux with AMD GPU (ROCm)
 cmake .. -DLTX_HIP=ON
 
-# macOS (Metal)
-cmake .. -DLTX_METAL=ON
-
-# Vulkan
+# Linux / Windows with Vulkan
 cmake .. -DLTX_VULKAN=ON
+
+# macOS CPU-only (disable Metal)
+cmake .. -DLTX_METAL=OFF
 
 cmake --build . --config Release -j$(nproc)
 ```
+
+| Platform        | Recommended cmake              | Backend   |
+|----------------|--------------------------------|-----------|
+| macOS          | `cmake ..`                     | Metal     |
+| Linux (NVIDIA) | `cmake .. -DLTX_CUDA=ON`       | CUDA      |
+| Linux (AMD)    | `cmake .. -DLTX_HIP=ON`        | ROCm/HIP  |
+| Linux / Win    | `cmake .. -DLTX_VULKAN=ON`     | Vulkan    |
 
 Builds two binaries:
 

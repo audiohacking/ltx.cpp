@@ -643,25 +643,18 @@ Scores are written by `convert.py --tokenizer` (via
 
 ---
 
-## 9. Adding a new backend (GPU/Metal/Vulkan)
+## 9. Backends (GPU: Metal, CUDA, Vulkan, ROCm)
 
-GGML abstracts hardware via *backends*.  Adding GPU support requires only a
-CMake flag:
+We follow the same pattern as [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp): **the build command determines the backend**. One backend per build; no platform-specific divergence in code.
 
-```bash
-cmake .. -DLTX_CUDA=ON      # NVIDIA
-cmake .. -DLTX_HIP=ON       # AMD ROCm
-cmake .. -DLTX_METAL=ON     # Apple Metal
-cmake .. -DLTX_VULKAN=ON    # Vulkan
-```
+- **macOS**: `cmake ..` defaults to Metal (Apple MPS). Use `-DLTX_METAL=OFF` for CPU-only.
+- **Linux (NVIDIA)**: `cmake .. -DLTX_CUDA=ON`
+- **Linux (AMD)**: `cmake .. -DLTX_HIP=ON`
+- **Linux / Windows**: `cmake .. -DLTX_VULKAN=ON` for Vulkan.
 
-From the C++ side there is nothing more to do — GGML automatically selects the
-best available backend at runtime.  If you want to *explicitly* target a
-backend, use `ggml_backend_*` APIs from `ggml-backend.h`.
+Currently inference uses the CPU path (`ggml_graph_compute_with_ctx`). To run on GPU when a backend is enabled, the next step is to use the GGML backend API in a backend-agnostic way: e.g. `ggml_backend_sched_new` with the chosen backend(s), `ggml_gallocr_new(backend_buffer_type)`, `ggml_gallocr_alloc_graph`, then `ggml_backend_graph_compute` (or `ggml_backend_sched_graph_compute`). That keeps a single code path for all platforms (Metal, CUDA, Vulkan, HIP).
 
-The main performance bottleneck is the DiT `forward()` call, which rebuilds a
-`ggml_cgraph` on every step.  A future improvement is to build the graph once
-and re-use it across steps by parameterising the timestep embedding.
+The main performance bottleneck is the DiT `forward()` call, which rebuilds a `ggml_cgraph` on every step. A future improvement is to build the graph once and re-use it across steps by parameterising the timestep embedding.
 
 ---
 
@@ -678,7 +671,7 @@ and where contributions are most welcome.
 | 4 | **3-D RoPE** | Positional embeddings are not yet applied | Add rotary embeddings along (t, h, w) axes to Q and K tensors |
 | 5 | **T5 tokenizer** | ~~Whitespace-split + per-char fallback~~ **Fixed**: full SentencePiece unigram Viterbi DP (when scores in GGUF) or greedy longest-match | — |
 | 6 | **`ltx-quantize` metadata** | ~~String arrays (tokenizer vocab) are skipped during quantization~~ **Fixed**: `gguf_set_kv` copies all KV pairs including arrays | — |
-| 7 | **Persistent scratch** | DiT allocates 1 GB of ggml scratch per forward call | Pre-allocate a single scratch context and reset between calls |
+| 7 | **Persistent scratch** | ~~DiT allocates 1 GB of ggml scratch per forward call~~ **Fixed**: single buffer (90% RAM) reused each forward (gpt-2 style) | — |
 | 8 | **Batch size > 1** | Only batch=1 is implemented | Add batch dimension to enable parallel generation |
 | 9 | **CFG single-pass** | CFG requires two full forward passes | Implement single-pass CFG by duplicating the batch |
 | 10 | **Threading** | `--threads` is parsed but not passed to `ggml_graph_compute_with_ctx` | Wire the thread count through to `ggml_graph_compute_with_ctx(ctx, gf, n_threads)` |

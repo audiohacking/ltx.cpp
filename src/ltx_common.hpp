@@ -62,26 +62,34 @@ struct LtxGgufModel {
         return ggml_get_tensor(ggml_ctx, name);
     }
 
-    // Read a string KV value (returns "" if missing).
+    // Open a safetensors file (e.g. VAE): populate ggml_ctx only; gguf_ctx stays nullptr.
+    // Tensor names are stored with "vae." prefix when not already present.
+    bool open_safetensors(const std::string & fpath);
+
+    // Read a string KV value (returns "" if missing). Safe when gguf_ctx is nullptr.
     std::string kv_str(const char * key) const {
+        if (!gguf_ctx) return "";
         int64_t idx = gguf_find_key(gguf_ctx, key);
         if (idx < 0) return "";
         return gguf_get_val_str(gguf_ctx, idx);
     }
 
     int64_t kv_i64(const char * key, int64_t def = 0) const {
+        if (!gguf_ctx) return def;
         int64_t idx = gguf_find_key(gguf_ctx, key);
         if (idx < 0) return def;
         return gguf_get_val_i64(gguf_ctx, idx);
     }
 
     uint32_t kv_u32(const char * key, uint32_t def = 0) const {
+        if (!gguf_ctx) return def;
         int64_t idx = gguf_find_key(gguf_ctx, key);
         if (idx < 0) return def;
         return gguf_get_val_u32(gguf_ctx, idx);
     }
 
     float kv_f32(const char * key, float def = 0.0f) const {
+        if (!gguf_ctx) return def;
         int64_t idx = gguf_find_key(gguf_ctx, key);
         if (idx < 0) return def;
         return gguf_get_val_f32(gguf_ctx, idx);
@@ -164,68 +172,7 @@ static void write_video_frames(const VideoBuffer & vbuf, const std::string & out
     LTX_LOG("wrote %d PPM frames with prefix '%s'", vbuf.frames, out_prefix.c_str());
 }
 
-// ── Image loading (PNG / JPG / BMP / TGA / PPM / …) ─────────────────────────
-//
-// Uses stb_image (vendored in src/stb_image.h, public domain) to decode
-// any common image format into 8-bit RGB.
-// Returns a VideoBuffer with frames=1 on success, frames=0 on failure.
-
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_ONLY_PNG
-#define STBI_ONLY_JPEG
-#define STBI_ONLY_BMP
-#define STBI_ONLY_TGA
-#define STBI_ONLY_PNM   // PPM / PGM / PBM
-#define STBI_NO_GIF
-#define STBI_NO_PSD
-#define STBI_NO_HDR
-#define STBI_NO_PIC
-#define STBI_FAILURE_USERMSG
-#include "stb_image.h"
-
-static VideoBuffer load_image(const std::string & path) {
-    int W = 0, H = 0, channels = 0;
-    // Force 3 output channels (RGB) regardless of source format.
-    uint8_t * data = stbi_load(path.c_str(), &W, &H, &channels, 3);
-    if (!data) {
-        LTX_ERR("failed to load image '%s': %s", path.c_str(), stbi_failure_reason());
-        return VideoBuffer(0, 0, 0);
-    }
-
-    VideoBuffer buf(1, H, W);
-    memcpy(buf.frame(0), data, (size_t)W * H * 3);
-    stbi_image_free(data);
-
-    LTX_LOG("loaded image: %s (%dx%d, original channels=%d)", path.c_str(), W, H, channels);
-    return buf;
-}
-
-// Bilinear resize of a uint8 RGB image [H_src × W_src × 3] → [H_dst × W_dst × 3].
-static std::vector<uint8_t> resize_bilinear(
-        const uint8_t * src, int W_src, int H_src,
-        int W_dst, int H_dst)
-{
-    std::vector<uint8_t> out(W_dst * H_dst * 3);
-    float sx = (float)W_src / W_dst;
-    float sy = (float)H_src / H_dst;
-
-    for (int yd = 0; yd < H_dst; ++yd)
-    for (int xd = 0; xd < W_dst; ++xd) {
-        float xf = (xd + 0.5f) * sx - 0.5f;
-        float yf = (yd + 0.5f) * sy - 0.5f;
-        int x0 = std::max(0, (int)xf),         x1 = std::min(W_src - 1, x0 + 1);
-        int y0 = std::max(0, (int)yf),         y1 = std::min(H_src - 1, y0 + 1);
-        float qx = xf - x0, qy = yf - y0;
-
-        for (int c = 0; c < 3; ++c) {
-            float v00 = src[(y0 * W_src + x0) * 3 + c];
-            float v10 = src[(y0 * W_src + x1) * 3 + c];
-            float v01 = src[(y1 * W_src + x0) * 3 + c];
-            float v11 = src[(y1 * W_src + x1) * 3 + c];
-            float v = (1 - qy) * ((1 - qx) * v00 + qx * v10)
-                    +      qy  * ((1 - qx) * v01 + qx * v11);
-            out[(yd * W_dst + xd) * 3 + c] = (uint8_t)(v + 0.5f);
-        }
-    }
-    return out;
-}
+// Image loading: implemented in ltx-generate.cpp (single TU with STB_IMAGE_IMPLEMENTATION).
+VideoBuffer load_image(const std::string & path);
+std::vector<uint8_t> resize_bilinear(
+    const uint8_t * src, int W_src, int H_src, int W_dst, int H_dst);
