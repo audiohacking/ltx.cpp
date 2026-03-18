@@ -16,7 +16,8 @@ navigate the known limitations.
    - [Build configurations](#build-configurations)
    - [Obtaining model files](#obtaining-model-files)
 4. [End-to-end data flow](#4-end-to-end-data-flow)
-5. [Source file reference](#5-source-file-reference)
+5. [Audio-video (AV) pipeline](#5-audio-video-av-pipeline)
+6. [Source file reference](#6-source-file-reference)
    - [ltx\_common.hpp](#ltx_commonhpp)
    - [scheduler.hpp](#schedulerhpp)
    - [t5\_encoder.hpp](#t5_encoderhpp)
@@ -25,25 +26,25 @@ navigate the known limitations.
    - [ltx-generate.cpp](#ltx-generatecpp)
    - [ltx-quantize.cpp](#ltx-quantizecpp)
    - [convert.py](#convertpy)
-6. [GGUF model format conventions](#6-gguf-model-format-conventions)
+7. [GGUF model format conventions](#7-gguf-model-format-conventions)
    - [DiT GGUF](#dit-gguf)
    - [VAE GGUF](#vae-gguf)
    - [T5 GGUF](#t5-gguf)
-7. [Image-to-video (I2V) design](#7-image-to-video-i2v-design)
+8. [Image-to-video (I2V) design](#8-image-to-video-i2v-design)
    - [VaeEncoder](#vaeencoder)
    - [Frame-conditioning schedule](#frame-conditioning-schedule)
    - [Hard-pinning at t=0](#hard-pinning-at-t0)
-8. [Key algorithms and design decisions](#8-key-algorithms-and-design-decisions)
+9. [Key algorithms and design decisions](#9-key-algorithms-and-design-decisions)
    - [Rectified Flow (RF) scheduling](#rectified-flow-rf-scheduling)
    - [Classifier-free guidance](#classifier-free-guidance)
    - [Patchify / unpatchify](#patchify--unpatchify)
    - [Latent dimension formulas](#latent-dimension-formulas)
    - [Tokenizer](#tokenizer)
-9. [Adding a new backend (GPU/Metal/Vulkan)](#9-adding-a-new-backend-gpumetalvulkan)
-10. [Known limitations and open tasks](#10-known-limitations-and-open-tasks)
-11. [Coding conventions](#11-coding-conventions)
-12. [Testing](#12-testing)
-13. [Contributing](#13-contributing)
+10. [Adding a new backend (GPU/Metal/Vulkan)](#10-adding-a-new-backend-gpumetalvulkan)
+11. [Known limitations and open tasks](#11-known-limitations-and-open-tasks)
+12. [Coding conventions](#12-coding-conventions)
+13. [Testing](#13-testing)
+14. [Contributing](#14-contributing)
 
 ---
 
@@ -90,6 +91,9 @@ ltx.cpp/
 ├── checkpoints.sh        Download raw HF safetensors checkpoints
 ├── models.sh             Download pre-quantised GGUF models from Unsloth/HF
 ├── quantize.sh           Shell wrapper: run ltx-quantize on all BF16 GGUFs
+├── docs/
+│   ├── AV_PIPELINE.md    Audio-video pipeline design (token concat, shapes, CLI)
+│   └── LTX_COMFY_REFERENCE.md  ComfyUI workflow reference
 │
 └── ggml/                 Git submodule — GGML tensor library
 ```
@@ -246,12 +250,32 @@ CLI args
   → start_lat / end_lat  [H_lat × W_lat × 128]
 
   These latents are blended into the live denoising latent after each Euler step
-  (see §7 for the full schedule).
+  (see §8 for the full schedule).
 ```
 
 ---
 
-## 5. Source file reference
+## 5. Audio-video (AV) pipeline
+
+**Branch: `audio-video`.** The LTX 2.3 GGUF DiT is a full **audio-video** model: it expects a single sequence of **concatenated video + audio** tokens and outputs a combined velocity that is split back into video and audio.
+
+**Data flow when `--av`:**
+
+1. **Latent init**: Video latent `[T_lat, H_lat, W_lat, C]` (as today) plus audio latent `[T_lat, 8, 16]` (C_audio=8, mel_bins=16), both filled with noise.
+2. **Per step**:  
+   - `patchify()` → video tokens `[n_video_tok, 128]`; `patchify_audio()` → audio tokens `[T_lat, 128]`.  
+   - Concat → `[n_video_tok + T_lat, 128]` = `[n_tok_total, Pd]`.  
+   - `LtxDiT::forward(combined, n_tok_total, …)` → combined velocity.  
+   - Split: first `n_video_tok` tokens → video velocity; remainder → audio velocity.  
+   - Unpatchify both; Euler step on video latent and on audio latent.  
+   - (Optional) frame conditioning on video only (unchanged).
+3. **Decode**: Video VAE decode → PPM frames (unchanged). Audio: denoised audio latent → waveform via a **latent-to-waveform** path (fake mel + overlap-add sinusoids) → 16-bit WAV (16 kHz). A full **audio VAE decoder** (safetensors) can be integrated later for higher-quality audio.
+
+**Code:** `patchify_audio` / `unpatchify_audio` in `ltx_dit.hpp`; combined patch buffer, split, and dual Euler step in `ltx-generate.cpp`; `write_wav()` and `latent_to_waveform()` in `ltx-generate.cpp`. Design details: [docs/AV_PIPELINE.md](docs/AV_PIPELINE.md).
+
+---
+
+## 6. Source file reference
 
 ### `ltx_common.hpp`
 
@@ -332,7 +356,7 @@ Weights layout expected in the GGUF (prefix `vae.decoder.*`):
 
 `decode(latents, T_lat, H_lat, W_lat)` runs a simplified per-frame 2-D decode
 with nearest-neighbour temporal upsampling.  Full causal 3-D conv decode is a
-planned improvement (see §10).
+planned improvement (see §11).
 
 #### `VaeEncoder`
 
@@ -368,10 +392,12 @@ model.diffusion_model.norm_out.linear.{weight,bias}
 ```
 Fallback names with prefix `dit.*` are also tried.
 
+**Audio (AV pipeline)**: `patchify_audio(lat, T, C, F)` and `unpatchify_audio(tok, T, C, F)` in the same header convert audio latent `[T, 8, 16]` ↔ `[T, 128]` tokens for concatenation with video tokens before the single DiT forward.
+
 **Forward pass** (per call to `LtxDiT::forward()`):
 1. Sinusoidal timestep embedding → MLP → `hidden_size` vector
 2. AdaLN-single linear → `6 × hidden_size` (scale/shift params; currently
-   stored but not yet fully applied per-block — see §10)
+   stored but not yet fully applied per-block — see §11)
 3. Patchify projection: `[N_tok, patch_dim]` → `[N_tok, hidden_size]`
 4. Caption projection: `[S, 4096]` → `[S, hidden_size]`
 5. N × transformer blocks:
@@ -411,11 +437,13 @@ Orchestrates the full inference pipeline.
 | `start_frame_path` | `--start-frame` | `""` (disabled) |
 | `end_frame_path` | `--end-frame` | `""` (disabled) |
 | `frame_strength` | `--frame-strength` | 1.0 |
+| `av` | `--av` | false (enable audio+video path) |
+| `audio_vae_path` | `--audio-vae` | `""` (optional; for full decoder when implemented) |
+| `out_wav` | `--out-wav` | `""` (default: `<out prefix>.wav` when `--av`) |
 | `threads` | `--threads` | 4 |
 | `verbose` | `-v` | false |
 
-**Output**: frames are written as `{out_prefix}_{NNNN}.ppm`.  The output
-directory is created automatically (including intermediate directories).
+**Output**: frames are written as `{out_prefix}_{NNNN}.ppm`.  When `--av`, a WAV file is also written (default `{out_prefix}.wav`).  The output directory is created automatically (including intermediate directories).
 
 ---
 
@@ -430,7 +458,7 @@ Rules:
 - Everything else → quantised to `target_type`
 
 All GGUF KV metadata is copied verbatim.  String arrays (e.g. the tokenizer
-vocabulary) are not currently copied — this is a known limitation (see §10).
+vocabulary) are not currently copied — this is a known limitation (see §11).
 
 Supported quant types: `Q4_K_M`, `Q5_K_M`, `Q6_K`, `Q8_0`, `BF16`, `F32`, `F16`.
 
@@ -458,7 +486,7 @@ For T5, the HF tokenizer vocabulary can be embedded into the GGUF via
 
 ---
 
-## 6. GGUF model format conventions
+## 7. GGUF model format conventions
 
 ### DiT GGUF
 
@@ -501,7 +529,7 @@ Architecture string: `"t5"`
 
 ---
 
-## 7. Image-to-video (I2V) design
+## 8. Image-to-video (I2V) design
 
 The I2V implementation does not modify the DiT architecture.  Instead it
 works by conditioning the *latent* directly at the boundary frames before and
@@ -553,7 +581,7 @@ appearance, regardless of any residual denoising drift.
 
 ---
 
-## 8. Key algorithms and design decisions
+## 9. Key algorithms and design decisions
 
 ### Rectified Flow (RF) scheduling
 
@@ -587,17 +615,19 @@ The unconditional embedding is computed by encoding the `--neg` prompt
 
 ### Patchify / unpatchify
 
-The DiT operates on *tokens*, not on the raw latent volume.  The latent
+The DiT operates on *tokens*, not on the raw latent volume.  The **video** latent
 `[T_lat, H_lat, W_lat, C]` is chunked into non-overlapping patches of size
 `(pt=1, ph=2, pw=2)` along the temporal, height, and width dimensions:
 
 ```
-patch_dim = pt * ph * pw * C = 1 * 2 * 2 * 128 = 512
+patch_dim = pt * ph * pw * C = 1 * 2 * 2 * 128 = 512  (or 128 for C=32)
 N_tok     = (T_lat/pt) * (H_lat/ph) * (W_lat/pw)
 ```
 
-`patchify()` and `unpatchify()` are helper functions called from
-`ltx-generate.cpp`.  Both are pure memory rearrangements with no arithmetic.
+`patchify()` and `unpatchify()` are helper functions in `ltx_dit.hpp` called from
+`ltx-generate.cpp`.  For the **audio-video** path, `patchify_audio()` and
+`unpatchify_audio()` convert audio latent `[T, 8, 16]` to/from `[T, 128]` tokens;
+video and audio token sequences are concatenated before the DiT forward and split after.  All are pure memory rearrangements with no arithmetic.
 
 ### Latent dimension formulas
 
@@ -643,7 +673,7 @@ Scores are written by `convert.py --tokenizer` (via
 
 ---
 
-## 9. Backends (GPU: Metal, CUDA, Vulkan, ROCm)
+## 10. Backends (GPU: Metal, CUDA, Vulkan, ROCm)
 
 We follow the same pattern as [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp): **the build command determines the backend**. One backend per build; no platform-specific divergence in code.
 
@@ -658,7 +688,7 @@ The main performance bottleneck is the DiT `forward()` call, which rebuilds a `g
 
 ---
 
-## 10. Known limitations and open tasks
+## 11. Known limitations and open tasks
 
 These are the main areas where the implementation is deliberately simplified
 and where contributions are most welcome.
@@ -677,10 +707,11 @@ and where contributions are most welcome.
 | 10 | **Threading** | `--threads` is parsed but not passed to `ggml_graph_compute_with_ctx` | Wire the thread count through to `ggml_graph_compute_with_ctx(ctx, gf, n_threads)` |
 | 11 | **Output formats** | Only binary PPM (P6) output | Add JPEG/PNG output via stb_image_write or a similar library |
 | 12 | **Windows `_mkdir`** | Only one level of directory is created on Windows | Implement recursive mkdir for Windows |
+| 13 | **Audio VAE decoder** | With `--av`, audio is synthesized from the denoised latent via a fallback (fake mel + overlap-add); no full audio VAE decode yet | Load `ltx-2.3-22b-dev_audio_vae.safetensors` and implement 2D conv decoder (see docs/AV_PIPELINE.md) |
 
 ---
 
-## 11. Coding conventions
+## 12. Coding conventions
 
 - **Language**: C++17 throughout; no exceptions (use return codes).
 - **Headers only**: all modules live in `src/*.hpp`.  Only the two `main()`
@@ -704,7 +735,7 @@ and where contributions are most welcome.
 
 ---
 
-## 12. Testing
+## 13. Testing
 
 There is no formal test suite yet.  Validation is currently done by:
 
@@ -726,16 +757,16 @@ There is no formal test suite yet.  Validation is currently done by:
 
 ---
 
-## 13. Contributing
+## 14. Contributing
 
 1. **Fork** the repository and create a branch from `main`.
-2. **Read §10** to find where help is most needed.
+2. **Read §11** to find where help is most needed.
 3. **Keep PRs focused** — one feature or fix per PR.
-4. **Match the style** described in §11.
+4. **Match the style** described in §12.
 5. **Document** any new CLI flag in both `print_usage()` (in
    `ltx-generate.cpp`) and `README.md`.
 6. **Update this file** (`DEV.md`) if you add a new module, change the GGUF
-   schema, or significantly alter the data flow.
+   schema, or significantly alter the data flow (e.g. AV pipeline in §5).
 7. **No model weights** should ever be committed to the repo.
 
 For questions, open a GitHub Discussion or issue in the

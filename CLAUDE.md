@@ -1,6 +1,8 @@
 # ltx.cpp
 
-C++ inference engine for LTX-Video (LTX 2.3) — text-to-video and image-to-video generation using GGML backends (Metal, CUDA, CPU).
+C++ inference engine for LTX-Video (LTX 2.3) — text-to-video, image-to-video, and **audio-video (AV)** generation using GGML backends (Metal, CUDA, CPU).
+
+**Branch `audio-video`**: same DiT sees concatenated video+audio latent; one denoise loop; output is video frames + WAV. See `docs/AV_PIPELINE.md` and README “Audio-video (AV)” section.
 
 ## Build
 
@@ -47,9 +49,14 @@ build/ltx-generate \
   --steps 20 --out output/frame
 ```
 
+**Audio-video (AV):** add `--av` and optionally `--out-wav path.wav` to get video frames + WAV from the same run. Mux with ffmpeg: `ffmpeg -framerate 24 -i out_%04d.ppm -i out.wav -c:v libx264 -c:a aac -shortest out.mp4`.
+
 Useful flags:
 - `-v` — verbose per-step logging
 - `--perf` — print CPU%/RSS/free-RAM/GPU-MB to stderr every 10 s
+- `--av` — enable audio+video path (concat latent → DiT → split → decode both)
+- `--audio-vae path` — optional; for full audio VAE decoder when implemented
+- `--out-wav path` — WAV output when `--av` (default: `<out prefix>.wav`)
 - `--start-frame img.png` — image-to-video (I2V)
 - `--end-frame img.png` — keyframe interpolation
 - `--seed N`, `--cfg F`, `--shift F`, `--threads N`
@@ -65,14 +72,15 @@ BIN=build_debug/ltx-generate bash scripts/test-gpu-migration.sh
 
 | File | Purpose |
 |------|---------|
-| `src/ltx-generate.cpp` | Main binary: arg parsing, model loading, denoising loop |
-| `src/ltx_dit.hpp` | DiT transformer (forward pass, block loop, Metal/CPU paths) |
+| `src/ltx-generate.cpp` | Main binary: arg parsing, model loading, denoising loop; AV path (concat/split, WAV output) |
+| `src/ltx_dit.hpp` | DiT transformer (forward pass, block loop); `patchify_audio` / `unpatchify_audio` for AV |
 | `src/video_vae.hpp` | VAE encoder/decoder (safetensors) |
 | `src/t5_encoder.hpp` | T5-XXL text encoder (GGUF) |
 | `src/scheduler.hpp` | RF flow scheduler (timesteps, Euler step, CFG) |
 | `src/ltx_perf.hpp` | Background perf monitor thread (CPU/RAM stats) |
 | `src/ltx_common.hpp` | Shared macros (`LTX_LOG`, `LTX_ERR`), GGML helpers |
 | `src/safetensors_loader.cpp` | safetensors file loader |
+| `docs/AV_PIPELINE.md` | AV pipeline design (token concat, shapes, CLI) |
 
 ## Architecture notes
 
@@ -87,3 +95,8 @@ BIN=build_debug/ltx-generate bash scripts/test-gpu-migration.sh
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `LTX_MIGRATE_MAX_TENSOR_MB` | `6144` | Max single-tensor size for GPU migration |
+
+## Branch: audio-video
+
+- **AV path**: with `--av`, video and audio latents are patchified, concatenated (video then audio tokens), passed through one DiT forward, then split; Euler step on both; video decoded with existing VAE, audio turned into WAV via a latent→waveform fallback.
+- **Full audio VAE** (safetensors decoder) is not yet implemented; audio quality uses the fallback. See `docs/AV_PIPELINE.md` and `DEV.md` §5.

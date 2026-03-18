@@ -4,6 +4,8 @@ Portable C++17 inference of **LTX-Video** (Lightricks) using
 [GGML](https://github.com/ggml-org/ggml) / GGUF.  
 Text-to-video generation runs on CPU, with build-time support for CUDA, ROCm, Metal, and Vulkan (same backend-per-build pattern as [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp)). No Python at inference time.
 
+**On the `audio-video` branch**: the same DiT is used for **audio+video** — concatenated video and audio latent tokens, one denoise loop, then split and decode to frames + WAV. See [Audio-video (AV)](#audio-video-av--video--wav-from-the-same-dit) and [docs/AV_PIPELINE.md](docs/AV_PIPELINE.md).
+
 Inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp) and
 [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp).
 
@@ -17,6 +19,7 @@ Inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp) and
 - Quantised GGUF weights (Q4\_K\_M → Q8\_0 → BF16)
 - Classifier-free guidance + flow-shift Euler sampler
 - PPM frame output (pipe to ffmpeg for MP4)
+- **Audio-video (AV) pipeline** — same DiT sees concatenated video+audio latent; output is video frames + WAV (see [docs/AV_PIPELINE.md](docs/AV_PIPELINE.md))
 - Single `ltx-generate` binary — no Python at runtime
 
 ---
@@ -82,6 +85,8 @@ Downloads three GGUF files into `models/`:
 | `ltxv-2b-*-Q8_0.gguf`            | Video DiT (2B params) | ~2.1 GB      |
 | `ltxv-vae-Q8_0.gguf`             | CausalVideoVAE        | ~400 MB      |
 | `t5-xxl-Q8_0.gguf`               | T5-XXL text encoder   | ~4.6 GB      |
+
+**LTX-2.3 (22B) GGUFs** we use come from [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF): **dev** (≥20 steps, better quality) and **distilled** (4–8 steps, draft/refine). Use `./models.sh` to pull DiT, video VAE, audio VAE, and text encoder; see `docs/LTX_COMFY_REFERENCE.md` for the full file list.
 
 ### Option B – Convert from safetensors
 
@@ -173,6 +178,28 @@ Convert the PPM output frames to MP4:
 ffmpeg -framerate 24 -i output/frame_%04d.ppm -c:v libx264 -pix_fmt yuv420p output.mp4
 ```
 
+### Audio-video (AV) — video + WAV from the same DiT
+
+The LTX 2.3 GGUF DiT is a full **audio-video** model: it expects **concatenated video + audio** latent tokens and outputs both. Use `--av` to run the full AV path (same denoise loop, then decode video and synthesize audio).
+
+```bash
+./build/ltx-generate \
+    --dit    models/ltx-2.3-22b-dev-Q4_K_M.gguf \
+    --vae    models/ltx-2.3-22b-dev_video_vae.safetensors \
+    --t5     models/t5-xxl-Q8_0.gguf \
+    --av --out output/av --out-wav output/av.wav \
+    --prompt "Ocean waves, seagulls, wind" \
+    --frames 25 --height 480 --width 704 --steps 20 --cfg 4.0
+```
+
+You get `output/av_0000.ppm` … and `output/av.wav`. Mux video + audio with ffmpeg:
+
+```bash
+ffmpeg -framerate 24 -i output/av_%04d.ppm -i output/av.wav -c:v libx264 -c:a aac -shortest output_av.mp4
+```
+
+Design details (token concat, shapes, audio VAE): [docs/AV_PIPELINE.md](docs/AV_PIPELINE.md).
+
 ---
 
 ## Command-Line Reference
@@ -196,6 +223,11 @@ Generation:
   --shift   <f>     Flow-shift parameter             (default: 3.0)
   --seed    <N>     RNG seed                         (default: 42)
   --out     <pfx>   Output frame file prefix         (default: output/frame)
+
+Audio-video (AV) pipeline:
+  --av              Enable audio+video (concat latent → DiT → split → decode both)
+  --audio-vae <path>  Audio VAE safetensors (optional with --av; for full decoder when implemented)
+  --out-wav  <path>   Output WAV path (default: &lt;out prefix&gt;.wav when --av)
 
 Image-to-video (I2V) conditioning:
   --start-frame  <path>  PNG/JPG/BMP/TGA/PPM image: animate from this reference frame
