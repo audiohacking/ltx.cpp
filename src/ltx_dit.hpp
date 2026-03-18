@@ -414,6 +414,8 @@ struct LtxDiT {
         std::vector<float> x_host((size_t)D * n_tok);
         std::vector<float> ctx_emb_host((size_t)D * seq_len);
         if (backend) {
+            x_in->data = nullptr; x_in->buffer = nullptr;
+            ctx_emb_in->data = nullptr; ctx_emb_in->buffer = nullptr;
             if (!ggml_gallocr_alloc_graph(galloc, gf_pre)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
             ggml_backend_tensor_set(x_in, latents, 0, (size_t)n_tok * Pd * sizeof(float));
             ggml_backend_tensor_set(ctx_emb_in, text_emb, 0, (size_t)seq_len * Cd * sizeof(float));
@@ -514,6 +516,9 @@ struct LtxDiT {
                     struct ggml_cgraph * gch = ggml_new_graph(ctx);
                     ggml_build_forward_expand(gch, out_c);
                     if (backend) {
+                        q_src_chunk->data = nullptr; q_src_chunk->buffer = nullptr;
+                        k_t->data = nullptr; k_t->buffer = nullptr;
+                        v_t->data = nullptr; v_t->buffer = nullptr;
                         if (!ggml_gallocr_alloc_graph(galloc, gch)) { ggml_free(ctx); return nullptr; }
                         ggml_backend_tensor_set(q_src_chunk, q_src_host + (size_t)start * D, 0, (size_t)len * D * sizeof(float));
                         ggml_backend_tensor_set(k_t, k_host.data(), 0, k_host.size() * sizeof(float));
@@ -585,6 +590,8 @@ struct LtxDiT {
                 ggml_build_forward_expand(gnx, nx);
                 nx_host.resize((size_t)D * n_tok);
                 if (backend) {
+                    x_in->data = nullptr; x_in->buffer = nullptr;
+                    ctx_emb_in->data = nullptr; ctx_emb_in->buffer = nullptr;
                     if (!ggml_gallocr_alloc_graph(galloc, gnx)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
                     ggml_backend_tensor_set(x_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
                     ggml_backend_tensor_set(ctx_emb_in, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
@@ -657,6 +664,9 @@ struct LtxDiT {
             struct ggml_cgraph * gf_blk = ggml_new_graph(ctx);
             ggml_build_forward_expand(gf_blk, h);
             if (backend) {
+                blk_x_in->data = nullptr; blk_x_in->buffer = nullptr;
+                ctx_emb_in->data = nullptr; ctx_emb_in->buffer = nullptr;
+                if (blk_sa_extra) { blk_sa_extra->data = nullptr; blk_sa_extra->buffer = nullptr; }
                 if (!ggml_gallocr_alloc_graph(galloc, gf_blk)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
                 ggml_backend_tensor_set(blk_x_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
                 ggml_backend_tensor_set(ctx_emb_in, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
@@ -692,6 +702,7 @@ struct LtxDiT {
         ggml_build_forward_expand(gf_post, x_fin);
         std::vector<float> out((size_t)n_tok * Pd);
         if (backend) {
+            x_fin_in->data = nullptr; x_fin_in->buffer = nullptr;
             if (!ggml_gallocr_alloc_graph(galloc, gf_post)) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
             ggml_backend_tensor_set(x_fin_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
             if (ggml_backend_graph_compute(backend, gf_post) != GGML_STATUS_SUCCESS) { ggml_free(ctx); ggml_gallocr_free(galloc); return {}; }
