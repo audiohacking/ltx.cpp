@@ -83,25 +83,28 @@ hf_download() {
     fi
 }
 
-# ── Model file definitions (existing GGUF on Hugging Face) ─────────────────────
+# ── DiT filename by quant (case statement: safe with set -u) ───────────────────
 
-declare -A DIT_FILES=(
-    ['Q2_K']="ltx-2.3-22b-dev-Q2_K.gguf"
-    ['Q3_K_M']="ltx-2.3-22b-dev-Q3_K_M.gguf"
-    ['Q3_K_S']="ltx-2.3-22b-dev-Q3_K_S.gguf"
-    ['Q4_0']="ltx-2.3-22b-dev-Q4_0.gguf"
-    ['Q4_1']="ltx-2.3-22b-dev-Q4_1.gguf"
-    ['Q4_K_M']="ltx-2.3-22b-dev-Q4_K_M.gguf"
-    ['Q4_K_S']="ltx-2.3-22b-dev-Q4_K_S.gguf"
-    ['Q5_0']="ltx-2.3-22b-dev-Q5_0.gguf"
-    ['Q5_1']="ltx-2.3-22b-dev-Q5_1.gguf"
-    ['Q5_K_M']="ltx-2.3-22b-dev-Q5_K_M.gguf"
-    ['Q5_K_S']="ltx-2.3-22b-dev-Q5_K_S.gguf"
-    ['Q6_K']="ltx-2.3-22b-dev-Q6_K.gguf"
-    ['Q8_0']="ltx-2.3-22b-dev-Q8_0.gguf"
-    ['BF16']="ltx-2.3-22b-dev-BF16.gguf"
-    ['F16']="ltx-2.3-22b-dev-F16.gguf"
-)
+get_dit_filename() {
+    case "$1" in
+        Q2_K)   echo "ltx-2.3-22b-dev-Q2_K.gguf" ;;
+        Q3_K_M) echo "ltx-2.3-22b-dev-Q3_K_M.gguf" ;;
+        Q3_K_S) echo "ltx-2.3-22b-dev-Q3_K_S.gguf" ;;
+        Q4_0)   echo "ltx-2.3-22b-dev-Q4_0.gguf" ;;
+        Q4_1)   echo "ltx-2.3-22b-dev-Q4_1.gguf" ;;
+        Q4_K_M) echo "ltx-2.3-22b-dev-Q4_K_M.gguf" ;;
+        Q4_K_S) echo "ltx-2.3-22b-dev-Q4_K_S.gguf" ;;
+        Q5_0)   echo "ltx-2.3-22b-dev-Q5_0.gguf" ;;
+        Q5_1)   echo "ltx-2.3-22b-dev-Q5_1.gguf" ;;
+        Q5_K_M) echo "ltx-2.3-22b-dev-Q5_K_M.gguf" ;;
+        Q5_K_S) echo "ltx-2.3-22b-dev-Q5_K_S.gguf" ;;
+        Q6_K)   echo "ltx-2.3-22b-dev-Q6_K.gguf" ;;
+        Q8_0)   echo "ltx-2.3-22b-dev-Q8_0.gguf" ;;
+        BF16)   echo "ltx-2.3-22b-dev-BF16.gguf" ;;
+        F16)    echo "ltx-2.3-22b-dev-F16.gguf" ;;
+        *)     echo "" ;;
+    esac
+}
 
 T5_FILE="t5-v1_1-xxl-encoder-Q8_0.gguf"
 
@@ -112,16 +115,33 @@ echo "DiT quant:        $QUANT"
 echo ""
 
 if [[ $DOWNLOAD_ALL -eq 1 ]]; then
-    for q in "${!DIT_FILES[@]}"; do
-        f="${DIT_FILES[$q]}"
+    while IFS= read -r line; do
+        q="${line%% *}"
+        f="${line#* }"
         echo "Downloading DiT [$q]: $f"
         hf_download "$HF_REPO" "$f" "$MODELS_DIR/$f"
-    done
-    DIT_EXAMPLE="${DIT_FILES['Q4_K_M']}"
+    done <<'DIT_LIST'
+Q2_K ltx-2.3-22b-dev-Q2_K.gguf
+Q3_K_M ltx-2.3-22b-dev-Q3_K_M.gguf
+Q3_K_S ltx-2.3-22b-dev-Q3_K_S.gguf
+Q4_0 ltx-2.3-22b-dev-Q4_0.gguf
+Q4_1 ltx-2.3-22b-dev-Q4_1.gguf
+Q4_K_M ltx-2.3-22b-dev-Q4_K_M.gguf
+Q4_K_S ltx-2.3-22b-dev-Q4_K_S.gguf
+Q5_0 ltx-2.3-22b-dev-Q5_0.gguf
+Q5_1 ltx-2.3-22b-dev-Q5_1.gguf
+Q5_K_M ltx-2.3-22b-dev-Q5_K_M.gguf
+Q5_K_S ltx-2.3-22b-dev-Q5_K_S.gguf
+Q6_K ltx-2.3-22b-dev-Q6_K.gguf
+Q8_0 ltx-2.3-22b-dev-Q8_0.gguf
+BF16 ltx-2.3-22b-dev-BF16.gguf
+F16 ltx-2.3-22b-dev-F16.gguf
+DIT_LIST
+    DIT_EXAMPLE="ltx-2.3-22b-dev-Q4_K_M.gguf"
 else
-    fn="${DIT_FILES[$QUANT]:-}"
+    fn="$(get_dit_filename "$QUANT")"
     if [[ -z "$fn" ]]; then
-        echo "Unknown quant: $QUANT. Choose from: ${!DIT_FILES[*]}"
+        echo "Unknown quant: $QUANT. Choose from: Q2_K, Q3_K_M, Q3_K_S, Q4_0, Q4_1, Q4_K_M, Q4_K_S, Q5_0, Q5_1, Q5_K_M, Q5_K_S, Q6_K, Q8_0, BF16, F16"
         exit 1
     fi
     echo "Downloading DiT [$QUANT]: $fn"
