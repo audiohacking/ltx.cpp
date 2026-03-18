@@ -96,23 +96,30 @@ struct LtxGgufModel {
     }
 };
 
-// Max size for a single weight buffer (e.g. Metal can fail on ~14GB). Skip migration if any tensor is larger.
-static constexpr size_t LTX_MIGRATE_MAX_TENSOR_BYTES = (size_t)6 * 1024 * 1024 * 1024; // 6 GB
+// Default max size for a single weight buffer (Metal often fails on very large buffers). 0 = no limit.
+// Override with env LTX_MIGRATE_MAX_TENSOR_MB (e.g. 0 to try full migration on high-memory devices).
+static constexpr size_t LTX_MIGRATE_MAX_TENSOR_BYTES_DEFAULT = (size_t)6 * 1024 * 1024 * 1024; // 6 GB
 
 // ── Backend: migrate context to backend (backend-agnostic) ───────────────────
 // Moves all tensors in ctx onto the given backend so inference can run on GPU
 // without backend-specific code. Uses one buffer per tensor to avoid single-buffer
 // size limits. Caller must free the returned buffers when done (stored in buf_out).
 // Returns number of buffers created, or 0 on failure / skip (e.g. tensor too large).
+// Env LTX_MIGRATE_MAX_TENSOR_MB: max size per tensor in MB; 0 = no limit (try full migration).
 static inline int ltx_backend_migrate_ctx(ggml_context * ctx, ggml_backend_t backend,
         std::vector<ggml_backend_buffer_t> & buf_out) {
     buf_out.clear();
     if (!ctx || !backend) return 0;
+    size_t max_tensor_bytes = LTX_MIGRATE_MAX_TENSOR_BYTES_DEFAULT;
+    if (const char * env = std::getenv("LTX_MIGRATE_MAX_TENSOR_MB")) {
+        long mb = std::atol(env);
+        if (mb >= 0) max_tensor_bytes = (mb == 0) ? (size_t)-1 : (size_t)mb * 1024u * 1024u;
+    }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     std::vector<size_t> sizes;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
-        if (sz > LTX_MIGRATE_MAX_TENSOR_BYTES) return 0; // skip migration if any tensor too large
+        if (sz > max_tensor_bytes) return 0; // skip migration if any tensor too large
         if (sz > 0) sizes.push_back(sz);
     }
     buf_out.reserve(sizes.size());

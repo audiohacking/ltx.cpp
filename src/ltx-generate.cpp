@@ -285,6 +285,7 @@ int main(int argc, char ** argv) {
             LTX_LOG("DiT weights on backend (%d buffers, %zu MB)", n_bufs, total_mb);
         } else {
             LTX_LOG("DiT weights could not be moved to backend, using CPU for DiT");
+            LTX_LOG("tip: set LTX_MIGRATE_MAX_TENSOR_MB=0 to try full GPU migration on high-memory devices");
             backend = nullptr;
         }
     }
