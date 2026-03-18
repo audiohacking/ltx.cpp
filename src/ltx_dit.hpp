@@ -72,26 +72,28 @@ struct AdaLNSingle {
 // ── Transformer block weights ─────────────────────────────────────────────────
 
 struct DiTBlock {
-    // Self-attention (with AdaLN)
-    struct ggml_tensor * norm1_w = nullptr, * norm1_b = nullptr;
-    struct ggml_tensor * attn1_q = nullptr, * attn1_q_b = nullptr;
-    struct ggml_tensor * attn1_k = nullptr, * attn1_k_b = nullptr;
-    struct ggml_tensor * attn1_v = nullptr, * attn1_v_b = nullptr;
-    struct ggml_tensor * attn1_o = nullptr, * attn1_o_b = nullptr;
-    // Optional: per-block AdaLN scale/shift projections
-    struct ggml_tensor * adaln_w = nullptr, * adaln_b = nullptr;
+    // Self-attention weights (LTX 2.3 has no explicit pre-norm; uses AdaLN scale/shift only)
+    struct ggml_tensor * attn1_q    = nullptr, * attn1_q_b   = nullptr;
+    struct ggml_tensor * attn1_k    = nullptr, * attn1_k_b   = nullptr;
+    struct ggml_tensor * attn1_v    = nullptr, * attn1_v_b   = nullptr;
+    struct ggml_tensor * attn1_o    = nullptr, * attn1_o_b   = nullptr;
+    struct ggml_tensor * attn1_qnorm = nullptr; // per-head RMS norm on Q
+    struct ggml_tensor * attn1_knorm = nullptr; // per-head RMS norm on K
+
+    // Per-block AdaLN learned offsets: scale_shift_table [D, 9]
+    // (9 = 3 signals × 3 sublayers: SA, CA, FFN)
+    struct ggml_tensor * adaln_w = nullptr;
 
     // Cross-attention
-    struct ggml_tensor * norm2_w = nullptr, * norm2_b = nullptr;
-    struct ggml_tensor * attn2_q = nullptr, * attn2_q_b = nullptr;
-    struct ggml_tensor * attn2_k = nullptr, * attn2_k_b = nullptr;
-    struct ggml_tensor * attn2_v = nullptr, * attn2_v_b = nullptr;
-    struct ggml_tensor * attn2_o = nullptr, * attn2_o_b = nullptr;
+    struct ggml_tensor * attn2_q    = nullptr, * attn2_q_b   = nullptr;
+    struct ggml_tensor * attn2_k    = nullptr, * attn2_k_b   = nullptr;
+    struct ggml_tensor * attn2_v    = nullptr, * attn2_v_b   = nullptr;
+    struct ggml_tensor * attn2_o    = nullptr, * attn2_o_b   = nullptr;
+    struct ggml_tensor * attn2_qnorm = nullptr;
+    struct ggml_tensor * attn2_knorm = nullptr;
 
-    // FFN (SwiGLU: gate, up, down)
-    struct ggml_tensor * norm3_w = nullptr, * norm3_b = nullptr;
+    // FFN (GEGLU: fc1_gate packs gate+up, fc2 = down)
     struct ggml_tensor * ff_gate = nullptr, * ff_gate_b = nullptr;
-    struct ggml_tensor * ff_up   = nullptr, * ff_up_b   = nullptr;
     struct ggml_tensor * ff_down = nullptr, * ff_down_b = nullptr;
 };
 
@@ -271,14 +273,15 @@ struct LtxDiT {
         final_norm_b = get("model.diffusion_model.norm_out.linear.bias");
         if (!final_norm_w) { final_norm_w = get("norm_out.linear.weight"); final_norm_b = get("norm_out.linear.bias"); }
 
-        // Transformer blocks (22B GGUF uses "transformer_blocks." without model.diffusion_model. prefix).
-        const char * block_prefix = get("transformer_blocks.0.norm1.weight")
+        // Transformer blocks.
+        // LTX 2.3 GGUF uses "transformer_blocks." prefix (no "model.diffusion_model." prefix).
+        const char * block_prefix = get("transformer_blocks.0.attn1.to_q.weight")
             ? "transformer_blocks." : "model.diffusion_model.transformer_blocks.";
         if (std::strstr(block_prefix, "transformer_blocks.") && !std::strstr(block_prefix, "model.")) {
             int n = 0;
             char lbuf[128];
             for (; n < 256; ++n) {
-                (void)snprintf(lbuf, sizeof(lbuf), "transformer_blocks.%d.norm1.weight", n);
+                (void)snprintf(lbuf, sizeof(lbuf), "transformer_blocks.%d.attn1.to_q.weight", n);
                 if (!get(lbuf)) break;
             }
             if (n > 0) cfg.num_layers = n;
@@ -292,33 +295,35 @@ struct LtxDiT {
     snprintf(buf, sizeof(buf), (pre + fmt).c_str(), i, ##__VA_ARGS__); \
     B.field = get(buf);
 
-            GET(norm1_w,  "%d.norm1.weight");
-            GET(norm1_b,  "%d.norm1.bias");
-            GET(adaln_w,  "%d.scale_shift_table");     // combined AdaLN params
-            GET(attn1_q,  "%d.attn1.to_q.weight");
-            GET(attn1_q_b,"%d.attn1.to_q.bias");
-            GET(attn1_k,  "%d.attn1.to_k.weight");
-            GET(attn1_k_b,"%d.attn1.to_k.bias");
-            GET(attn1_v,  "%d.attn1.to_v.weight");
-            GET(attn1_v_b,"%d.attn1.to_v.bias");
-            GET(attn1_o,  "%d.attn1.to_out.0.weight");
-            GET(attn1_o_b,"%d.attn1.to_out.0.bias");
-            GET(norm2_w,  "%d.norm2.weight");
-            GET(norm2_b,  "%d.norm2.bias");
-            GET(attn2_q,  "%d.attn2.to_q.weight");
-            GET(attn2_q_b,"%d.attn2.to_q.bias");
-            GET(attn2_k,  "%d.attn2.to_k.weight");
-            GET(attn2_k_b,"%d.attn2.to_k.bias");
-            GET(attn2_v,  "%d.attn2.to_v.weight");
-            GET(attn2_v_b,"%d.attn2.to_v.bias");
-            GET(attn2_o,  "%d.attn2.to_out.0.weight");
-            GET(attn2_o_b,"%d.attn2.to_out.0.bias");
-            GET(norm3_w,  "%d.ff.net.0.weight");
-            GET(ff_gate,  "%d.ff.net.0.proj.weight");
-            GET(ff_gate_b,"%d.ff.net.0.proj.bias");
-            GET(ff_up,    "%d.ff.net.0.proj.weight");  // SwiGLU: proj packs gate+up
-            GET(ff_down,  "%d.ff.net.2.weight");
-            GET(ff_down_b,"%d.ff.net.2.bias");
+            // Per-block AdaLN: scale_shift_table [D, 9] (9 = 3 sublayers × 3 signals)
+            GET(adaln_w,    "%d.scale_shift_table");
+            // Self-attention
+            GET(attn1_q,    "%d.attn1.to_q.weight");
+            GET(attn1_q_b,  "%d.attn1.to_q.bias");
+            GET(attn1_k,    "%d.attn1.to_k.weight");
+            GET(attn1_k_b,  "%d.attn1.to_k.bias");
+            GET(attn1_v,    "%d.attn1.to_v.weight");
+            GET(attn1_v_b,  "%d.attn1.to_v.bias");
+            GET(attn1_o,    "%d.attn1.to_out.0.weight");
+            GET(attn1_o_b,  "%d.attn1.to_out.0.bias");
+            GET(attn1_qnorm,"%d.attn1.q_norm.weight");
+            GET(attn1_knorm,"%d.attn1.k_norm.weight");
+            // Cross-attention
+            GET(attn2_q,    "%d.attn2.to_q.weight");
+            GET(attn2_q_b,  "%d.attn2.to_q.bias");
+            GET(attn2_k,    "%d.attn2.to_k.weight");
+            GET(attn2_k_b,  "%d.attn2.to_k.bias");
+            GET(attn2_v,    "%d.attn2.to_v.weight");
+            GET(attn2_v_b,  "%d.attn2.to_v.bias");
+            GET(attn2_o,    "%d.attn2.to_out.0.weight");
+            GET(attn2_o_b,  "%d.attn2.to_out.0.bias");
+            GET(attn2_qnorm,"%d.attn2.q_norm.weight");
+            GET(attn2_knorm,"%d.attn2.k_norm.weight");
+            // FFN (GEGLU): ff.net.0.proj packs gate+up [2*ff_dim, D]; ff.net.2 = down
+            GET(ff_gate,    "%d.ff.net.0.proj.weight");
+            GET(ff_gate_b,  "%d.ff.net.0.proj.bias");
+            GET(ff_down,    "%d.ff.net.2.weight");
+            GET(ff_down_b,  "%d.ff.net.2.bias");
 #undef GET
         }
 
@@ -327,405 +332,208 @@ struct LtxDiT {
         return true;
     }
 
-    // ── Forward pass (CPU, float32) ───────────────────────────────────────────
+    // ── Forward pass ─────────────────────────────────────────────────────────
+    //
+    // Builds the entire DiT forward graph in one shot and dispatches via
+    // ggml_backend_sched (Metal + CPU auto-scheduled).
     //
     // Inputs:
-    //   latents:       [N_tok, patch_dim]  (patchified video latent)
-    //   text_emb:      [S, cross_dim]      (T5 encoder output)
-    //   timestep:      scalar in [0,1]     (noise level)
-    //   n_tok:         number of latent patches
-    //   seq_len:       text sequence length
-    //   scratch_buf:   persistent buffer for ggml (reused each call; use dit_scratch_size_bytes()).
-    //   scratch_size: size of scratch_buf in bytes.
-    //   backend:       optional GGML backend (from ggml_backend_init_best()); if non-null, inference runs on backend (e.g. Metal/CUDA).
+    //   latents:   [n_tok, patch_dim]  patchified video latent
+    //   text_emb:  [seq_len, cross_dim] T5 encoder output
+    //   timestep:  scalar in [0,1]     noise level
+    //   sched:     backend scheduler (Metal+CPU or CPU-only)
     //
-    // Returns predicted noise/velocity: [N_tok × patch_dim]
-    // Chunked (pre → each block → post), same scratch_buf reused; peak ~20 GB like ComfyUI.
+    // Returns predicted velocity: [n_tok × patch_dim]
     std::vector<float> forward(
-            const float * latents,   int n_tok,
-            const float * text_emb,  int seq_len,
-            float timestep,
-            void * scratch_buf, size_t scratch_size,
-            ggml_backend_t backend = nullptr,
-            bool show_blocks = false) const
+            const float * latents,  int n_tok,
+            const float * text_emb, int seq_len,
+            float         timestep,
+            ggml_backend_sched_t sched) const
     {
-        (void)timestep;
-        if (!scratch_buf || scratch_size == 0) { LTX_ERR("DiT forward: scratch_buf and scratch_size required"); return {}; }
-        int D  = cfg.hidden_size;
-        int Pd = cfg.patch_dim();
-        int Cd = cfg.cross_attn_dim;
-        int H  = cfg.num_heads;
-        int Dh = cfg.head_dim;
+        int D   = cfg.hidden_size;
+        int Pd  = cfg.patch_dim();
+        int Cd  = cfg.cross_attn_dim;
+        int H   = cfg.num_heads;
+        int Dh  = cfg.head_dim;
 
-        auto w_for_mul = [](struct ggml_context * ctx, struct ggml_tensor * W, struct ggml_tensor * src) -> struct ggml_tensor * {
-            if (!W) return nullptr;
-            if (W->ne[0] == src->ne[0]) return W;
-            return ggml_cont(ctx, ggml_transpose(ctx, W));
-        };
-
-        struct ggml_init_params params;
-        if (backend) {
-            static const size_t LTX_DIT_MAX_GRAPH_NODES = 8192;
-            static size_t no_alloc_size = 0;
-            static std::vector<uint8_t> no_alloc_buf;
-            if (no_alloc_buf.empty()) {
-                no_alloc_size = ggml_tensor_overhead() * LTX_DIT_MAX_GRAPH_NODES + ggml_graph_overhead_custom(LTX_DIT_MAX_GRAPH_NODES, false);
-                no_alloc_buf.resize(no_alloc_size);
-            }
-            params = { no_alloc_size, no_alloc_buf.data(), true };
-        } else {
-            params = { scratch_size, scratch_buf, false };
-        }
-
-        // ── Pre: patch_embed + cap_proj ───────────────────────────────────────
-        struct ggml_context * ctx = ggml_init(params);
+        // Allocate graph metadata context (no_alloc — sched owns actual buffers).
+        // Per-block: ~120 nodes (SA + CA + FFN + AdaLN + q/k norms); 28 blocks → ~3360 nodes
+        const size_t MAX_NODES = (size_t)cfg.num_layers * 128 + 512;
+        size_t ctx_size = ggml_tensor_overhead() * MAX_NODES * 2
+                        + ggml_graph_overhead_custom(MAX_NODES, false);
+        std::vector<uint8_t> ctx_buf(ctx_size);
+        struct ggml_init_params ip = { ctx_size, ctx_buf.data(), /*no_alloc=*/true };
+        struct ggml_context * ctx = ggml_init(ip);
         if (!ctx) { LTX_ERR("DiT: ggml_init failed"); return {}; }
-        struct ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Pd, n_tok);
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+        // ── Inputs ────────────────────────────────────────────────────────────
+        struct ggml_tensor * x_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Pd, n_tok);
+        struct ggml_tensor * ctx_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Cd, seq_len);
+        struct ggml_tensor * t_in   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x_in,   "latents");  ggml_set_input(x_in);
+        ggml_set_name(ctx_in, "text_emb"); ggml_set_input(ctx_in);
+        ggml_set_name(t_in,   "timestep"); ggml_set_input(t_in);
+
+        // ── Timestep embedding → tproj [6*D] ──────────────────────────────────
+        // t → scale(×1000) → sinusoidal(freq_dim) → linear_1+silu → linear_2+silu
+        // → adaln.linear → [6*D] shared modulation for all blocks
+        struct ggml_tensor * tproj = nullptr;
+        if (adaln.emb_w1 && adaln.emb_w2 && adaln.linear_w) {
+            struct ggml_tensor * t_s   = ggml_scale(ctx, t_in, 1000.0f);
+            struct ggml_tensor * t_emb = ggml_timestep_embedding(ctx, t_s, cfg.freq_dim, 10000);
+            struct ggml_tensor * h     = ggml_mul_mat(ctx, adaln.emb_w1, t_emb);
+            if (adaln.emb_b1) h = ggml_add(ctx, h, adaln.emb_b1);
+            h = ggml_silu(ctx, h);
+            h = ggml_mul_mat(ctx, adaln.emb_w2, h);
+            if (adaln.emb_b2) h = ggml_add(ctx, h, adaln.emb_b2);
+            h = ggml_silu(ctx, h);
+            tproj = ggml_mul_mat(ctx, adaln.linear_w, h);
+            if (adaln.linear_b) tproj = ggml_add(ctx, tproj, adaln.linear_b);
+        }
+
+        // ── Patch embed + caption projection ──────────────────────────────────
         struct ggml_tensor * x = x_in;
-        if (!backend) memcpy(x->data, latents, (size_t)n_tok * Pd * sizeof(float));
         if (patch_embed_w) {
-            x = ggml_mul_mat(ctx, w_for_mul(ctx, patch_embed_w, x), x);
-            x = ggml_cont(ctx, x);
-            if (patch_embed_b) {
-                struct ggml_tensor * b2 = ggml_repeat(ctx, patch_embed_b,
-                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int)x->ne[0], (int)x->ne[1]));
-                x = ggml_add(ctx, x, b2);
-            }
+            x = ggml_mul_mat(ctx, patch_embed_w, x);
+            if (patch_embed_b) x = ggml_add(ctx, x, patch_embed_b);
         }
-        struct ggml_tensor * ctx_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Cd, seq_len);
-        struct ggml_tensor * ctx_emb = ctx_emb_in;
-        if (!backend) memcpy(ctx_emb->data, text_emb, (size_t)seq_len * Cd * sizeof(float));
+        struct ggml_tensor * enc = ctx_in;
         if (cap_proj_w) {
-            ctx_emb = ggml_mul_mat(ctx, w_for_mul(ctx, cap_proj_w, ctx_emb), ctx_emb);
-            ctx_emb = ggml_cont(ctx, ctx_emb);
-            if (cap_proj_b) {
-                struct ggml_tensor * b2 = ggml_repeat(ctx, cap_proj_b,
-                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int)ctx_emb->ne[0], (int)ctx_emb->ne[1]));
-                ctx_emb = ggml_add(ctx, ctx_emb, b2);
-            }
+            enc = ggml_mul_mat(ctx, cap_proj_w, enc);
+            if (cap_proj_b) enc = ggml_add(ctx, enc, cap_proj_b);
         }
-        struct ggml_cgraph * gf_pre = ggml_new_graph(ctx);
-        ggml_build_forward_expand(gf_pre, x);
-        ggml_build_forward_expand(gf_pre, ctx_emb);
-        std::vector<float> x_host((size_t)D * n_tok);
-        std::vector<float> ctx_emb_host((size_t)D * seq_len);
-        if (backend) {
-            ggml_backend_buffer_t pre_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-            if (!pre_buf) { ggml_free(ctx); return {}; }
-            ggml_backend_tensor_set(x_in, latents, 0, (size_t)n_tok * Pd * sizeof(float));
-            ggml_backend_tensor_set(ctx_emb_in, text_emb, 0, (size_t)seq_len * Cd * sizeof(float));
-            if (ggml_backend_graph_compute(backend, gf_pre) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(pre_buf); ggml_free(ctx); return {}; }
-            ggml_backend_tensor_get(x, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
-            ggml_backend_tensor_get(ctx_emb, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
-            ggml_backend_buffer_free(pre_buf);
-        } else {
-            ggml_graph_compute_with_ctx(ctx, gf_pre, 4);
-            memcpy(x_host.data(), x->data, (size_t)D * n_tok * sizeof(float));
-            memcpy(ctx_emb_host.data(), ctx_emb->data, (size_t)D * seq_len * sizeof(float));
-        }
-        if (backend) ggml_free(ctx); else ggml_reset(ctx);
 
-        // Query chunk size to avoid materializing n_tok×n_tok attention (ComfyUI uses flash/memory-efficient attn).
-        // kq is (Dh,Nkv,chunk) = 128*36960*chunk*4 bytes; 256 -> ~4.8 GB, with soft_max copy fits in 21 GB.
-        const int ATTN_Q_CHUNK = 256;
-        auto proj_3d = [&](struct ggml_context * c, struct ggml_tensor * W, struct ggml_tensor * b,
-                          struct ggml_tensor * src, int N) -> struct ggml_tensor * {
-            if (!W) return ggml_new_tensor_3d(c, GGML_TYPE_F32, Dh, H, N);
-            struct ggml_tensor * out = ggml_mul_mat(c, w_for_mul(c, W, src), src);
-            out = ggml_cont(c, out);
-            if (b) {
-                struct ggml_tensor * b2 = ggml_repeat(c, b,
-                    ggml_new_tensor_2d(c, GGML_TYPE_F32, (int)out->ne[0], (int)out->ne[1]));
-                out = ggml_add(c, out, b2);
+        // Helper: linear proj → reshape [Dh, H, S] → permute → [Dh, S, H] (flash_attn layout)
+        const float attn_scale = 1.0f / sqrtf((float)Dh);
+        // Project src → Q/K/V, optionally apply RMS norm (q/k_norm weight [D]) before head-split.
+        // norm_w shape: [D] — applied per-token over the full hidden dim before reshape into heads.
+        auto qkv_proj = [&](struct ggml_tensor * W, struct ggml_tensor * b,
+                            struct ggml_tensor * norm_w,
+                            struct ggml_tensor * src, int S) -> struct ggml_tensor * {
+            struct ggml_tensor * o = ggml_mul_mat(ctx, W, src); // [D, S]
+            if (b)      o = ggml_add(ctx, o, b);
+            if (norm_w) {
+                o = ggml_rms_norm(ctx, o, cfg.norm_eps); // normalize per token over D
+                o = ggml_mul(ctx, o, norm_w);            // scale by learned weight [D]
             }
-            return ggml_reshape_3d(c, out, Dh, H, N);
-        };
-        auto attn = [&](struct ggml_context * c, struct ggml_tensor * q_src, struct ggml_tensor * kv_src,
-                        int Nq, int Nkv,
-                        struct ggml_tensor * Wq, struct ggml_tensor * Wk,
-                        struct ggml_tensor * Wv, struct ggml_tensor * Wo,
-                        struct ggml_tensor * bq, struct ggml_tensor * bk,
-                        struct ggml_tensor * bv, struct ggml_tensor * bo,
-                        float * out_host,
-                        const float * q_src_host)  // when non-null: chunked path uses this instead of viewing q_src (q_src not yet computed)
-            -> struct ggml_tensor *
-        {
-            if (out_host && q_src_host && Nq > ATTN_Q_CHUNK && Nkv == Nq) {
-                // Chunked self-attention: K,V once, then Q in chunks (avoids n_tok×n_tok matrix).
-                if (backend) { ctx = ggml_init(params); if (!ctx) return nullptr; }
-                // For the backend path, kv_src may live in a previously freed Metal buffer
-                // (e.g. the gnx scratch freed just before this call). Create a fresh input
-                // tensor and upload from the host copy that the caller already computed.
-                struct ggml_tensor * kv_in;
-                if (backend) {
-                    kv_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, Nkv);
-                } else {
-                    kv_in = kv_src;
-                }
-                struct ggml_tensor * k = proj_3d(ctx, Wk, bk, kv_in, Nkv);
-                struct ggml_tensor * v = proj_3d(ctx, Wv, bv, kv_in, Nkv);
-                k = ggml_permute(ctx, k, 0, 2, 1, 3);
-                v = ggml_permute(ctx, v, 1, 2, 0, 3);
-                k = ggml_cont(ctx, k);
-                v = ggml_cont(ctx, v);
-                struct ggml_cgraph * gkv = ggml_new_graph(ctx);
-                ggml_build_forward_expand(gkv, k);
-                ggml_build_forward_expand(gkv, v);
-                std::vector<float> k_host((size_t)Dh * Nkv * H);
-                std::vector<float> v_host((size_t)Dh * Nkv * H);
-                if (backend) {
-                    ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-                    if (!kv_buf) { ggml_free(ctx); return nullptr; }
-                    // kv_in is a fresh tensor; populate from the host copy of kv_src
-                    ggml_backend_tensor_set(kv_in, q_src_host, 0, (size_t)Nkv * D * sizeof(float));
-                    if (ggml_backend_graph_compute(backend, gkv) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(kv_buf); ggml_free(ctx); return nullptr; }
-                    ggml_backend_tensor_get(k, k_host.data(), 0, k_host.size() * sizeof(float));
-                    ggml_backend_tensor_get(v, v_host.data(), 0, v_host.size() * sizeof(float));
-                    ggml_backend_buffer_free(kv_buf);
-                } else {
-                    ggml_graph_compute_with_ctx(ctx, gkv, 4);
-                    memcpy(k_host.data(), k->data, k_host.size() * sizeof(float));
-                    memcpy(v_host.data(), v->data, v_host.size() * sizeof(float));
-                }
-                if (backend) ggml_free(ctx); else ggml_reset(ctx);
-
-                for (int start = 0; start < Nq; start += ATTN_Q_CHUNK) {
-                    int len = (start + ATTN_Q_CHUNK <= Nq) ? ATTN_Q_CHUNK : (Nq - start);
-                    if (backend) { ctx = ggml_init(params); if (!ctx) return nullptr; }
-                    struct ggml_tensor * q_src_chunk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, len);
-                    if (!backend) memcpy(q_src_chunk->data, q_src_host + (size_t)start * D, (size_t)len * D * sizeof(float));
-                    struct ggml_tensor * q_chunk = proj_3d(ctx, Wq, bq, q_src_chunk, len);
-                    q_chunk = ggml_permute(ctx, q_chunk, 0, 2, 1, 3);
-                    q_chunk = ggml_cont(ctx, q_chunk);
-                    struct ggml_tensor * k_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Dh, Nkv, H);
-                    struct ggml_tensor * v_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Nkv, Dh, H);
-                    if (!backend) {
-                        memcpy(k_t->data, k_host.data(), k_host.size() * sizeof(float));
-                        for (int64_t i = 0; i < Nkv; ++i)
-                            for (int64_t j = 0; j < Dh; ++j)
-                                for (int h = 0; h < H; ++h)
-                                    ((float *)v_t->data)[(i * Dh + j) * H + h] = ((const float *)v_host.data())[(h * Nkv + i) * Dh + j];
-                    }
-                    struct ggml_tensor * kq = ggml_mul_mat(ctx, k_t, q_chunk);
-                    kq = ggml_scale(ctx, kq, 1.0f / sqrtf((float)Dh));
-                    kq = ggml_soft_max(ctx, kq);
-                    struct ggml_tensor * out_c = ggml_mul_mat(ctx, v_t, kq);
-                    out_c = ggml_permute(ctx, out_c, 0, 2, 1, 3);
-                    out_c = ggml_cont(ctx, out_c);
-                    out_c = ggml_reshape_2d(ctx, out_c, D, len);
-                    if (Wo) {
-                        out_c = ggml_mul_mat(ctx, w_for_mul(ctx, Wo, out_c), out_c);
-                        out_c = ggml_cont(ctx, out_c);
-                        if (bo) {
-                            struct ggml_tensor * b2 = ggml_repeat(ctx, bo,
-                                ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int)out_c->ne[0], (int)out_c->ne[1]));
-                            out_c = ggml_add(ctx, out_c, b2);
-                        }
-                    }
-                    struct ggml_cgraph * gch = ggml_new_graph(ctx);
-                    ggml_build_forward_expand(gch, out_c);
-                    if (backend) {
-                        ggml_backend_buffer_t ch_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-                        if (!ch_buf) { ggml_free(ctx); return nullptr; }
-                        ggml_backend_tensor_set(q_src_chunk, q_src_host + (size_t)start * D, 0, (size_t)len * D * sizeof(float));
-                        ggml_backend_tensor_set(k_t, k_host.data(), 0, k_host.size() * sizeof(float));
-                        std::vector<float> v_t_layout((size_t)Nkv * Dh * H);
-                        for (int64_t i = 0; i < Nkv; ++i)
-                            for (int64_t j = 0; j < Dh; ++j)
-                                for (int h = 0; h < H; ++h)
-                                    v_t_layout[(size_t)((i * Dh + j) * H + h)] = v_host.data()[(size_t)((h * Nkv + i) * Dh + j)];
-                        ggml_backend_tensor_set(v_t, v_t_layout.data(), 0, v_t_layout.size() * sizeof(float));
-                        if (ggml_backend_graph_compute(backend, gch) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(ch_buf); ggml_free(ctx); return nullptr; }
-                        ggml_backend_tensor_get(out_c, out_host + (size_t)start * D, 0, (size_t)len * D * sizeof(float));
-                        ggml_backend_buffer_free(ch_buf);
-                    } else {
-                        ggml_graph_compute_with_ctx(ctx, gch, 4);
-                        memcpy(out_host + (size_t)start * D, out_c->data, (size_t)len * D * sizeof(float));
-                    }
-                    if (backend) ggml_free(ctx); else ggml_reset(ctx);
-                }
-                return nullptr;
-            }
-            struct ggml_tensor * q = proj_3d(c, Wq, bq, q_src, Nq);
-            struct ggml_tensor * k = proj_3d(c, Wk, bk, kv_src, Nkv);
-            struct ggml_tensor * v = proj_3d(c, Wv, bv, kv_src, Nkv);
-            q = ggml_permute(c, q, 0, 2, 1, 3);
-            k = ggml_permute(c, k, 0, 2, 1, 3);
-            v = ggml_permute(c, v, 1, 2, 0, 3);
-            k = ggml_cont(c, k);
-            v = ggml_cont(c, v);
-            struct ggml_tensor * kq = ggml_mul_mat(c, k, q);
-            kq = ggml_scale(c, kq, 1.0f / sqrtf((float)Dh));
-            kq = ggml_soft_max(c, kq);
-            struct ggml_tensor * out = ggml_mul_mat(c, v, kq);
-            out = ggml_permute(c, out, 0, 2, 1, 3);
-            out = ggml_cont(c, out);
-            out = ggml_reshape_2d(c, out, D, Nq);
-            if (Wo) {
-                out = ggml_mul_mat(c, w_for_mul(c, Wo, out), out);
-                out = ggml_cont(c, out);
-                if (bo) {
-                    struct ggml_tensor * b2 = ggml_repeat(c, bo,
-                        ggml_new_tensor_2d(c, GGML_TYPE_F32, (int)out->ne[0], (int)out->ne[1]));
-                    out = ggml_add(c, out, b2);
-                }
-            }
-            return out;
+            o = ggml_reshape_3d(ctx, o, Dh, H, S);
+            o = ggml_permute(ctx, o, 0, 2, 1, 3); // → [Dh, S, H, 1]
+            return ggml_cont(ctx, o);
         };
 
-        // ── Blocks: one context per block, same scratch buffer ─────────────────
+        // ── Transformer blocks ─────────────────────────────────────────────────
+        // LTX 2.3 architecture (no pre-norm layers; only AdaLN + q/k norms):
+        //   scale_shift_table [D, 9]:  9 = 3 sublayers × (shift, scale, gate)
+        //     [0..2]: SA  (shift_sa,  scale_sa,  gate_sa)
+        //     [3..5]: CA  (shift_ca,  scale_ca,  gate_ca)
+        //     [6..8]: FFN (shift_ffn, scale_ffn, gate_ffn)
         for (int li = 0; li < cfg.num_layers; ++li) {
             const auto & B = blocks[li];
-            if (show_blocks) {
-                fprintf(stderr, "\r[ltx]   block %2d/%d  ", li + 1, cfg.num_layers);
-                fflush(stderr);
-            }
-            if (backend) { ctx = ggml_init(params); if (!ctx) { LTX_ERR("DiT: block ggml_init failed"); return {}; } }
-            struct ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-            if (!backend) memcpy(x_in->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
-            struct ggml_tensor * ctx_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, seq_len);
-            if (!backend) memcpy(ctx_emb_in->data, ctx_emb_host.data(), (size_t)D * seq_len * sizeof(float));
 
-            struct ggml_tensor * h = x_in;
-            struct ggml_tensor * blk_x_in = x_in;
-            struct ggml_tensor * blk_sa_extra = nullptr;
-            std::vector<float> sa_out_host((size_t)D * n_tok);
-            std::vector<float> nx_host;
-            struct ggml_tensor * nx = h;
-            if (B.norm1_w) {
-                nx = ggml_rms_norm(ctx, nx, cfg.norm_eps);
-                nx = ggml_mul(ctx, nx, B.norm1_w);
+            // AdaLN: scale_shift_table [D, 9] + shared tproj [9*D] → 9 modulation vectors
+            struct ggml_tensor * shift_sa  = nullptr, * scale_sa  = nullptr, * gate_sa  = nullptr;
+            struct ggml_tensor * shift_ca  = nullptr, * scale_ca  = nullptr, * gate_ca  = nullptr;
+            struct ggml_tensor * shift_ffn = nullptr, * scale_ffn = nullptr, * gate_ffn = nullptr;
+            if (tproj && B.adaln_w) {
+                struct ggml_tensor * ss = B.adaln_w;
+                if (ss->type != GGML_TYPE_F32) ss = ggml_cast(ctx, ss, GGML_TYPE_F32);
+                struct ggml_tensor * m = ggml_add(ctx, ggml_reshape_1d(ctx, ss, 9 * D), tproj);
+                size_t Db = (size_t)D * sizeof(float);
+                shift_sa  = ggml_view_1d(ctx, m, D, 0 * Db);
+                scale_sa  = ggml_view_1d(ctx, m, D, 1 * Db);
+                gate_sa   = ggml_view_1d(ctx, m, D, 2 * Db);
+                shift_ca  = ggml_view_1d(ctx, m, D, 3 * Db);
+                scale_ca  = ggml_view_1d(ctx, m, D, 4 * Db);
+                gate_ca   = ggml_view_1d(ctx, m, D, 5 * Db);
+                shift_ffn = ggml_view_1d(ctx, m, D, 6 * Db);
+                scale_ffn = ggml_view_1d(ctx, m, D, 7 * Db);
+                gate_ffn  = ggml_view_1d(ctx, m, D, 8 * Db);
             }
-            const float * q_src_host_ptr = nullptr;
-            if (n_tok > ATTN_Q_CHUNK) {
-                struct ggml_cgraph * gnx = ggml_new_graph(ctx);
-                ggml_build_forward_expand(gnx, nx);
-                nx_host.resize((size_t)D * n_tok);
-                if (backend) {
-                    ggml_backend_buffer_t nx_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-                    if (!nx_buf) { ggml_free(ctx); return {}; }
-                    ggml_backend_tensor_set(x_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
-                    ggml_backend_tensor_set(ctx_emb_in, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
-                    if (ggml_backend_graph_compute(backend, gnx) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(nx_buf); ggml_free(ctx); return {}; }
-                    ggml_backend_tensor_get(nx, nx_host.data(), 0, (size_t)D * n_tok * sizeof(float));
-                    ggml_backend_buffer_free(nx_buf);
-                } else {
-                    ggml_graph_compute_with_ctx(ctx, gnx, 4);
-                    memcpy(nx_host.data(), nx->data, (size_t)D * n_tok * sizeof(float));
-                    ggml_reset(ctx);
+
+            // ── Self-attention ──────────────────────────────────────────────────
+            // AdaLN modulation: x_mod = (1 + scale) * x + shift = x + x*scale + shift
+            struct ggml_tensor * nx = x;
+            if (scale_sa) {
+                nx = ggml_add(ctx, ggml_add(ctx, nx, ggml_mul(ctx, nx, scale_sa)), shift_sa);
+            }
+            if (B.attn1_q) {
+                struct ggml_tensor * q = qkv_proj(B.attn1_q, B.attn1_q_b, B.attn1_qnorm, nx, n_tok);
+                struct ggml_tensor * k = qkv_proj(B.attn1_k, B.attn1_k_b, B.attn1_knorm, nx, n_tok);
+                struct ggml_tensor * v = qkv_proj(B.attn1_v, B.attn1_v_b, nullptr,        nx, n_tok);
+                struct ggml_tensor * sa = ggml_flash_attn_ext(ctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
+                sa = ggml_cont(ctx, ggml_reshape_2d(ctx, sa, D, n_tok));
+                if (B.attn1_o) {
+                    sa = ggml_mul_mat(ctx, B.attn1_o, sa);
+                    if (B.attn1_o_b) sa = ggml_add(ctx, sa, B.attn1_o_b);
                 }
-                q_src_host_ptr = nx_host.data();
-            }
-            struct ggml_tensor * sa_out = attn(ctx, nx, nx, n_tok, n_tok,
-                B.attn1_q, B.attn1_k, B.attn1_v, B.attn1_o,
-                B.attn1_q_b, B.attn1_k_b, B.attn1_v_b, B.attn1_o_b,
-                sa_out_host.data(), q_src_host_ptr);
-            if (sa_out) {
-                h = ggml_add(ctx, h, ggml_cont(ctx, sa_out));
-            } else {
-                // ctx was already freed inside the attn Q-chunk loop (backend) or needs reset (CPU)
-                if (backend) { ctx = ggml_init(params); if (!ctx) { LTX_ERR("DiT: block ctx after chunked attn failed"); return {}; } } else ggml_reset(ctx);
-                struct ggml_tensor * x_in2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-                if (!backend) memcpy(x_in2->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
-                struct ggml_tensor * sa_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-                if (!backend) memcpy(sa_t->data, sa_out_host.data(), (size_t)D * n_tok * sizeof(float));
-                h = ggml_add(ctx, x_in2, sa_t);
-                blk_x_in = x_in2;
-                blk_sa_extra = sa_t;
-                ctx_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, seq_len);
-                if (!backend) memcpy(ctx_emb_in->data, ctx_emb_host.data(), (size_t)D * seq_len * sizeof(float));
+                if (gate_sa) sa = ggml_mul(ctx, sa, gate_sa);
+                x = ggml_add(ctx, x, sa);
             }
 
-            struct ggml_tensor * cx = h;
-            if (B.norm2_w) {
-                cx = ggml_rms_norm(ctx, cx, cfg.norm_eps);
-                cx = ggml_mul(ctx, cx, B.norm2_w);
+            // ── Cross-attention ─────────────────────────────────────────────────
+            struct ggml_tensor * cx = x;
+            if (scale_ca) {
+                cx = ggml_add(ctx, ggml_add(ctx, cx, ggml_mul(ctx, cx, scale_ca)), shift_ca);
             }
-            struct ggml_tensor * ca_out = attn(ctx, cx, ctx_emb_in, n_tok, seq_len,
-                B.attn2_q, B.attn2_k, B.attn2_v, B.attn2_o,
-                B.attn2_q_b, B.attn2_k_b, B.attn2_v_b, B.attn2_o_b,
-                nullptr, nullptr);
-            h = ggml_add(ctx, h, ggml_cont(ctx, ca_out));
+            if (B.attn2_q) {
+                struct ggml_tensor * cq = qkv_proj(B.attn2_q, B.attn2_q_b, B.attn2_qnorm, cx,  n_tok);
+                struct ggml_tensor * ck = qkv_proj(B.attn2_k, B.attn2_k_b, B.attn2_knorm, enc, seq_len);
+                struct ggml_tensor * cv = qkv_proj(B.attn2_v, B.attn2_v_b, nullptr,        enc, seq_len);
+                struct ggml_tensor * ca = ggml_flash_attn_ext(ctx, cq, ck, cv, nullptr, attn_scale, 0.0f, 0.0f);
+                ca = ggml_cont(ctx, ggml_reshape_2d(ctx, ca, D, n_tok));
+                if (B.attn2_o) {
+                    ca = ggml_mul_mat(ctx, B.attn2_o, ca);
+                    if (B.attn2_o_b) ca = ggml_add(ctx, ca, B.attn2_o_b);
+                }
+                if (gate_ca) ca = ggml_mul(ctx, ca, gate_ca);
+                x = ggml_add(ctx, x, ca);
+            }
 
-            struct ggml_tensor * fx = h;
-            if (B.norm3_w) {
-                fx = ggml_rms_norm(ctx, fx, cfg.norm_eps);
-                fx = ggml_mul(ctx, fx, B.norm3_w);
-            }
+            // ── FFN (GEGLU) ──────────────────────────────────────────────────────
             if (B.ff_gate && B.ff_down) {
-                struct ggml_tensor * gate = ggml_mul_mat(ctx, w_for_mul(ctx, B.ff_gate, fx), fx);
-                gate = ggml_cont(ctx, gate);
-                if (B.ff_gate_b) {
-                    struct ggml_tensor * b2 = ggml_repeat(ctx, B.ff_gate_b,
-                        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int)gate->ne[0], (int)gate->ne[1]));
-                    gate = ggml_add(ctx, gate, b2);
+                struct ggml_tensor * fx = x;
+                if (scale_ffn) {
+                    fx = ggml_add(ctx, ggml_add(ctx, fx, ggml_mul(ctx, fx, scale_ffn)), shift_ffn);
                 }
-                int ff_dim = (int)gate->ne[0], half_ff = ff_dim / 2;
-                struct ggml_tensor * g_half  = ggml_view_2d(ctx, gate, half_ff, n_tok, gate->nb[1], 0);
-                struct ggml_tensor * up_half = ggml_view_2d(ctx, gate, half_ff, n_tok, gate->nb[1], half_ff * (int)ggml_element_size(gate));
-                g_half = ggml_gelu(ctx, g_half);
-                struct ggml_tensor * ffn_mid = ggml_mul(ctx, g_half, up_half);
-                struct ggml_tensor * ffn_out = ggml_mul_mat(ctx, w_for_mul(ctx, B.ff_down, ffn_mid), ffn_mid);
-                ffn_out = ggml_cont(ctx, ffn_out);
-                if (B.ff_down_b) {
-                    struct ggml_tensor * b2 = ggml_repeat(ctx, B.ff_down_b,
-                        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int)ffn_out->ne[0], (int)ffn_out->ne[1]));
-                    ffn_out = ggml_add(ctx, ffn_out, b2);
-                }
-                h = ggml_add(ctx, h, ggml_cont(ctx, ffn_out));
+                struct ggml_tensor * gu      = ggml_mul_mat(ctx, B.ff_gate, fx);
+                if (B.ff_gate_b) gu = ggml_add(ctx, gu, B.ff_gate_b);
+                // LTX 2.3 uses GELU activation (not split GEGLU): ff_dim = ne[1] of ff_gate
+                struct ggml_tensor * ffn_mid = ggml_gelu(ctx, gu);
+                struct ggml_tensor * ffn_out = ggml_mul_mat(ctx, B.ff_down, ffn_mid);
+                if (B.ff_down_b) ffn_out = ggml_add(ctx, ffn_out, B.ff_down_b);
+                if (gate_ffn)    ffn_out = ggml_mul(ctx, ffn_out, gate_ffn);
+                x = ggml_add(ctx, x, ffn_out);
             }
-            struct ggml_cgraph * gf_blk = ggml_new_graph(ctx);
-            ggml_build_forward_expand(gf_blk, h);
-            if (backend) {
-                ggml_backend_buffer_t blk_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-                if (!blk_buf) { ggml_free(ctx); return {}; }
-                ggml_backend_tensor_set(blk_x_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
-                ggml_backend_tensor_set(ctx_emb_in, ctx_emb_host.data(), 0, (size_t)D * seq_len * sizeof(float));
-                if (blk_sa_extra) ggml_backend_tensor_set(blk_sa_extra, sa_out_host.data(), 0, (size_t)D * n_tok * sizeof(float));
-                if (ggml_backend_graph_compute(backend, gf_blk) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(blk_buf); ggml_free(ctx); return {}; }
-                ggml_backend_tensor_get(h, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
-                ggml_backend_buffer_free(blk_buf);
-            } else {
-                ggml_graph_compute_with_ctx(ctx, gf_blk, 4);
-                memcpy(x_host.data(), h->data, (size_t)D * n_tok * sizeof(float));
-            }
-            if (backend) ggml_free(ctx); else ggml_reset(ctx);
         }
 
-        // ── Post: final norm + proj_out ───────────────────────────────────────
-        if (backend) { ctx = ggml_init(params); if (!ctx) { LTX_ERR("DiT: post ggml_init failed"); return {}; } }
-        struct ggml_tensor * x_fin_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
-        struct ggml_tensor * x_fin = x_fin_in;
-        if (!backend) memcpy(x_fin->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
-        if (final_norm_w) {
-            x_fin = ggml_rms_norm(ctx, x_fin, cfg.norm_eps);
-            x_fin = ggml_mul(ctx, x_fin, final_norm_w);
-        }
+        // ── Final norm + proj_out ─────────────────────────────────────────────
+        if (final_norm_w) { x = ggml_rms_norm(ctx, x, cfg.norm_eps); x = ggml_mul(ctx, x, final_norm_w); }
         if (proj_out_w) {
-            x_fin = ggml_mul_mat(ctx, w_for_mul(ctx, proj_out_w, x_fin), x_fin);
-            x_fin = ggml_cont(ctx, x_fin);
-            if (proj_out_b) {
-                struct ggml_tensor * b2 = ggml_repeat(ctx, proj_out_b,
-                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int)x_fin->ne[0], (int)x_fin->ne[1]));
-                x_fin = ggml_add(ctx, x_fin, b2);
-            }
+            x = ggml_mul_mat(ctx, proj_out_w, x);
+            if (proj_out_b) x = ggml_add(ctx, x, proj_out_b);
         }
-        struct ggml_cgraph * gf_post = ggml_new_graph(ctx);
-        ggml_build_forward_expand(gf_post, x_fin);
+        ggml_set_name(x, "velocity");
+        ggml_set_output(x);
+        ggml_build_forward_expand(gf, x);
+
+        // ── Schedule → allocate → set inputs → compute → retrieve ────────────
+        ggml_backend_sched_reset(sched);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            LTX_ERR("DiT: sched alloc failed"); ggml_free(ctx); return {};
+        }
+        ggml_backend_tensor_set(x_in,   latents,   0, (size_t)n_tok   * Pd * sizeof(float));
+        ggml_backend_tensor_set(ctx_in, text_emb,  0, (size_t)seq_len * Cd * sizeof(float));
+        ggml_backend_tensor_set(t_in,   &timestep, 0, sizeof(float));
+
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            LTX_ERR("DiT: compute failed"); ggml_free(ctx); return {};
+        }
+
         std::vector<float> out((size_t)n_tok * Pd);
-        if (backend) {
-            ggml_backend_buffer_t post_buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-            if (!post_buf) { ggml_free(ctx); return {}; }
-            ggml_backend_tensor_set(x_fin_in, x_host.data(), 0, (size_t)D * n_tok * sizeof(float));
-            if (ggml_backend_graph_compute(backend, gf_post) != GGML_STATUS_SUCCESS) { ggml_backend_buffer_free(post_buf); ggml_free(ctx); return {}; }
-            ggml_backend_tensor_get(x_fin, out.data(), 0, (size_t)n_tok * Pd * sizeof(float));
-            ggml_backend_buffer_free(post_buf);
-        } else {
-            ggml_graph_compute_with_ctx(ctx, gf_post, 4);
-            memcpy(out.data(), x_fin->data, (size_t)n_tok * Pd * sizeof(float));
-        }
+        ggml_backend_tensor_get(x, out.data(), 0, out.size() * sizeof(float));
         ggml_free(ctx);
-        ctx = nullptr;
         return out;
     }
 };

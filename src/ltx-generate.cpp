@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <sys/stat.h>   // mkdir
 #if defined(_WIN32)
 #  include <direct.h>   // _mkdir
@@ -250,28 +251,48 @@ int main(int argc, char ** argv) {
     LtxDiT dit;
     if (!dit.load(dit_model)) return 1;
 
-    // ── Backend (GGML abstraction: best available GPU or CPU) ───────────────
-    ggml_backend_t backend = ggml_backend_init_best();
-    if (!backend) backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    // ── Backend: load all plugins, then build Metal+CPU scheduler ───────────
+    ggml_backend_load_all();
+
+    int n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
+    ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_cpu_set_n_threads(cpu_backend, n_threads);
+    LTX_LOG("CPU threads: %d", n_threads);
+
+    ggml_backend_t gpu_backend = ggml_backend_init_best();
+    if (gpu_backend && ggml_backend_is_cpu(gpu_backend)) {
+        // init_best returned CPU — we already have one
+        ggml_backend_free(gpu_backend);
+        gpu_backend = nullptr;
+    }
+
     std::vector<ggml_backend_buffer_t> dit_weight_buffers;
-    if (backend) {
-        LTX_LOG("backend: %s", ggml_backend_name(backend));
-        int n_bufs = ltx_backend_migrate_ctx(dit_model.ggml_ctx, backend, dit_weight_buffers);
+    ggml_backend_t migrate_target = gpu_backend ? gpu_backend : cpu_backend;
+    {
+        LTX_LOG("backend: %s", ggml_backend_name(migrate_target));
+        int n_bufs = ltx_backend_migrate_ctx(dit_model.ggml_ctx, migrate_target, dit_weight_buffers);
         if (n_bufs > 0) {
             size_t total_mb = 0;
             for (ggml_backend_buffer_t b : dit_weight_buffers) total_mb += ggml_backend_buffer_get_size(b) / (1024 * 1024);
-            LTX_LOG("DiT weights on backend (%d buffers, %zu MB)", n_bufs, total_mb);
+            LTX_LOG("DiT weights on %s (%d buffers, %zu MB)", ggml_backend_name(migrate_target), n_bufs, total_mb);
         } else {
-            LTX_LOG("DiT weights could not be moved to backend, using CPU for DiT");
-            LTX_LOG("tip: set LTX_MIGRATE_MAX_TENSOR_MB=0 to try full GPU migration on high-memory devices");
-            backend = nullptr;
+            LTX_LOG("DiT weight migration failed — running on CPU");
+            if (gpu_backend) { ggml_backend_free(gpu_backend); gpu_backend = nullptr; }
         }
     }
+
+    // Scheduler: [GPU, CPU] (or CPU-only). Automatically routes ops to the best available backend.
+    ggml_backend_t sched_backends[2];
+    int n_sched = 0;
+    if (gpu_backend) sched_backends[n_sched++] = gpu_backend;
+    sched_backends[n_sched++] = cpu_backend;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(sched_backends, nullptr, n_sched, 8192, false, true);
+    LTX_LOG("scheduler: %d backend(s)", n_sched);
 
     // ── Perf monitor (optional --perf flag) ──────────────────────────────────
     size_t gpu_weight_mb = 0;
     for (ggml_backend_buffer_t b : dit_weight_buffers) gpu_weight_mb += ggml_backend_buffer_get_size(b) / (1024 * 1024);
-    std::string backend_name = backend ? std::string(ggml_backend_name(backend)) : "";
+    std::string backend_name = gpu_backend ? std::string(ggml_backend_name(gpu_backend)) : "CPU";
     std::unique_ptr<LtxPerfMonitor> perf_mon;
     if (args.perf)
         perf_mon = std::make_unique<LtxPerfMonitor>(10, backend_name, gpu_weight_mb);
@@ -349,32 +370,10 @@ int main(int argc, char ** argv) {
     std::vector<float> latents(lat_size);
     rng.fill(latents.data(), lat_size);
 
-    // ── Persistent DiT scratch (reused each forward pass) ─────────────────────
-    // Metal/GPU path: forward() uses no_alloc+backend buffers; scratch is unused.
-    // CPU path: ggml bump-allocates one block's intermediates from this buffer.
-    //   Peak ≈ 64 × n_tok × hidden_size × f32 + 64 MB overhead.
-    size_t dit_scratch_size;
-    if (backend) {
-        dit_scratch_size = 1; // unused on GPU/Metal path
-    } else {
-        size_t per_tok = (size_t)64 * dit.cfg.hidden_size * sizeof(float);
-        dit_scratch_size = per_tok * (size_t)n_tok + (size_t)64 * 1024 * 1024;
-        // Cap at 32 GB (very generous upper bound for any foreseeable config)
-        if (dit_scratch_size > (size_t)32 * 1024 * 1024 * 1024)
-            dit_scratch_size = (size_t)32 * 1024 * 1024 * 1024;
-    }
-    void * dit_scratch_buf = std::malloc(dit_scratch_size);
-    if (!dit_scratch_buf) {
-        LTX_ERR("failed to allocate DiT scratch (%zu MB)", dit_scratch_size / (1024 * 1024));
-        return 1;
-    }
-    if (!backend)
-        LTX_LOG("DiT scratch: %zu MB (CPU path, n_tok=%d)", dit_scratch_size / (1024 * 1024), n_tok);
-
     // ── Denoising loop ────────────────────────────────────────────────────────
 
-    RFScheduler sched(args.steps, args.shift, do_cfg);
-    std::vector<float> ts = sched.timesteps();
+    RFScheduler rf_sched(args.steps, args.shift, do_cfg);
+    std::vector<float> ts = rf_sched.timesteps();
 
     LTX_LOG("starting denoising (%d steps) ...", args.steps);
 
@@ -395,10 +394,9 @@ int main(int argc, char ** argv) {
 
         // Conditional velocity.
         std::vector<float> v_cond = dit.forward(
-            patches.data(), n_tok, text_emb.data(), seq_len, t_cur,
-            dit_scratch_buf, dit_scratch_size, backend, /*show_blocks=*/!args.verbose);
+            patches.data(), n_tok, text_emb.data(), seq_len, t_cur, sched);
 
-        if (v_cond.empty()) { std::free(dit_scratch_buf); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (backend) ggml_backend_free(backend); return 1; }
+        if (v_cond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
 
         // Unpatchify velocity.
         std::vector<float> vel_cond = unpatchify(
@@ -409,9 +407,8 @@ int main(int argc, char ** argv) {
         if (do_cfg) {
             // Unconditional velocity.
             std::vector<float> v_uncond = dit.forward(
-                patches.data(), n_tok, uncond_emb.data(), seq_len, t_cur,
-                dit_scratch_buf, dit_scratch_size, backend, /*show_blocks=*/false);
-            if (v_uncond.empty()) { std::free(dit_scratch_buf); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (backend) ggml_backend_free(backend); return 1; }
+                patches.data(), n_tok, uncond_emb.data(), seq_len, t_cur, sched);
+            if (v_uncond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
             std::vector<float> vel_uncond = unpatchify(
                 v_uncond.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);
             RFScheduler::apply_cfg(
@@ -455,11 +452,11 @@ int main(int argc, char ** argv) {
         }
     }
     fprintf(stderr, "\n");
-    std::free(dit_scratch_buf);
-    dit_scratch_buf = nullptr;
+    ggml_backend_sched_free(sched);
     for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b);
     dit_weight_buffers.clear();
-    if (backend) { ggml_backend_free(backend); backend = nullptr; }
+    if (gpu_backend) { ggml_backend_free(gpu_backend); gpu_backend = nullptr; }
+    ggml_backend_free(cpu_backend); cpu_backend = nullptr;
 
     LTX_LOG("denoising complete, decoding with VAE ...");
 
