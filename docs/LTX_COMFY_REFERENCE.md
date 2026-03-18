@@ -4,22 +4,28 @@ Reference only — no Python. This describes the working ComfyUI setup so ltx.cp
 
 ## LTX-2.3-GGUF (models we use)
 
-We use the [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF) quantized DiT and VAEs. Unsloth Dynamic 2.0 upcasts important layers; tooling from ComfyUI-GGUF (city96).
+We use the [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF) repo for **DiT**, **VAE**, and **text_encoders**. Same repo layout: [main tree](https://huggingface.co/unsloth/LTX-2.3-GGUF/tree/main) (dev DiT at root, `vae/`, `text_encoders/`), [distilled/](https://huggingface.co/unsloth/LTX-2.3-GGUF/tree/main/distilled) (distilled DiT). Unsloth Dynamic 2.0 upcasts important layers; tooling from ComfyUI-GGUF (city96).
 
-- **Dev**: full 22B DiT, needs ≥20 steps, better quality. Use for main generation.
-- **Distilled**: few-step (4–8), CFG=1; useful as draft or refine (e.g. LoRA on top of dev).
+- **Dev**: DiT at repo root (`ltx-2.3-22b-dev-*.gguf`), VAE and connectors from `vae/` and `text_encoders/` (dev_*). ≥20 steps, best quality.
+- **Distilled**: DiT in `distilled/` (`ltx-2.3-22b-distilled-*.gguf`), VAE and connectors `vae/ltx-2.3-22b-distilled_*`, `text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors`. Few-step (4–8), CFG=1. Use `./models.sh --distilled`.
 
 Base model: [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3). LTX-2.3 is a DiT-based **audio-video** foundation model (synchronized video + audio in one model).
 
 ## Model files (what the workflow uses)
 
+All from [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF) unless noted:
+
 | Role | File | Format | Source |
 |------|------|--------|--------|
-| DiT (UNet) | `ltx-2.3-22b-dev-Q4_K_M.gguf` | GGUF | unsloth/LTX-2.3-GGUF |
-| Video VAE | `ltx-2.3-22b-dev_video_vae.safetensors` | safetensors | unsloth/LTX-2.3-GGUF vae/ |
-| Audio VAE | `ltx-2.3-22b-dev_audio_vae.safetensors` | safetensors | unsloth/LTX-2.3-GGUF vae/ |
-| Text encoder | `gemma-3-12b-it-qat-UD-Q4_K_XL.gguf` | GGUF | unsloth/gemma-3-12b-it-qat-GGUF |
-| Embedding connectors | `ltx-2.3-22b-dev_embeddings_connectors.safetensors` | safetensors | unsloth/LTX-2.3-GGUF text_encoders/ |
+| DiT (UNet) dev | `ltx-2.3-22b-dev-Q4_K_M.gguf` | GGUF | repo root |
+| DiT (UNet) distilled | `ltx-2.3-22b-distilled-Q4_K_M.gguf` | GGUF | [distilled/](https://huggingface.co/unsloth/LTX-2.3-GGUF/tree/main/distilled) |
+| Video VAE | `ltx-2.3-22b-dev_video_vae.safetensors` | safetensors | **vae/** |
+| Video VAE (distilled) | `ltx-2.3-22b-distilled_video_vae.safetensors` | safetensors | **vae/** |
+| Audio VAE | `ltx-2.3-22b-dev_audio_vae.safetensors` | safetensors | **vae/** |
+| Audio VAE (distilled) | `ltx-2.3-22b-distilled_audio_vae.safetensors` | safetensors | **vae/** |
+| Embedding connectors (dev) | `ltx-2.3-22b-dev_embeddings_connectors.safetensors` | safetensors | **text_encoders/** |
+| Embedding connectors (distilled) | `ltx-2.3-22b-distilled_embeddings_connectors.safetensors` | safetensors | **text_encoders/** |
+| Text encoder (Gemma) | `gemma-3-12b-it-qat-UD-Q4_K_XL.gguf` | GGUF | unsloth/gemma-3-12b-it-qat-GGUF |
 | Optional LoRA | `ltx-2.3-22b-distilled-lora-384.safetensors` | safetensors | Lightricks/LTX-2.3 |
 | Optional upscaler | `ltx-2.3-spatial-upscaler-x2-1.0.safetensors` | safetensors | Lightricks/LTX-2.3 |
 

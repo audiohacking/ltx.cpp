@@ -73,9 +73,10 @@ Builds two binaries:
 ```bash
 pip install huggingface_hub          # for hf_hub_download
 
-./models.sh                          # Q8_0 (~7 GB total)
+./models.sh                          # Dev DiT (default) + T5 + VAE + extras
+./models.sh --distilled              # Distilled DiT (few-step) instead of dev
 ./models.sh --quant Q4_K_M           # smaller, faster
-./models.sh --all                    # every quant
+./models.sh --all                    # every quant (dev or distilled)
 ```
 
 Downloads three GGUF files into `models/`:
@@ -86,7 +87,7 @@ Downloads three GGUF files into `models/`:
 | `ltxv-vae-Q8_0.gguf`             | CausalVideoVAE        | ~400 MB      |
 | `t5-xxl-Q8_0.gguf`               | T5-XXL text encoder   | ~4.6 GB      |
 
-**LTX-2.3 (22B) GGUFs** we use come from [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF): **dev** (≥20 steps, better quality) and **distilled** (4–8 steps, draft/refine). Use `./models.sh` to pull DiT, video VAE, audio VAE, and text encoder; see `docs/LTX_COMFY_REFERENCE.md` for the full file list.
+**LTX-2.3 (22B)** — All from [unsloth/LTX-2.3-GGUF](https://huggingface.co/unsloth/LTX-2.3-GGUF): **DiT** (dev at repo root, or [distilled/](https://huggingface.co/unsloth/LTX-2.3-GGUF/tree/main/distilled)), **VAE** (`vae/` — video + audio safetensors), **text encoders** (`text_encoders/` — embeddings_connectors for Gemma). Use `./models.sh` for dev (default) or `./models.sh --distilled` for distilled DiT + matching VAE and connectors. See `docs/LTX_COMFY_REFERENCE.md` for the full file list.
 
 ### Option B – Convert from safetensors
 

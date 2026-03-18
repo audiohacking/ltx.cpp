@@ -25,15 +25,17 @@ cmake -B build -DLTX_HIP=ON     # ROCm/AMD
 
 ## Models
 
-Download with `./models.sh` (requires `huggingface-cli`):
+Download with `./models.sh` (requires `curl` or `wget`):
 ```bash
-./models.sh              # DiT Q4_K_M + T5 Q8_0 + VAE + extras
+./models.sh              # Dev DiT (default) + T5 + VAE + extras
+./models.sh --distilled  # Distilled DiT (few-step 4–8, CFG=1) from same repo
 ./models.sh --minimal    # DiT + T5 + VAE only
 ./models.sh --quant Q8_0 # different DiT quant
 ```
 
 Models land flat under `models/`. Key files:
-- `models/ltx-2.3-22b-dev-Q4_K_M.gguf` — DiT weights
+- `models/ltx-2.3-22b-dev-Q4_K_M.gguf` — Dev DiT (default)
+- `models/ltx-2.3-22b-distilled-Q4_K_M.gguf` — Distilled DiT (with `--distilled`)
 - `models/ltx-2.3-22b-dev_video_vae.safetensors` — VAE
 - `models/t5-v1_1-xxl-encoder-Q8_0.gguf` — T5 text encoder
 
