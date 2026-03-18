@@ -137,9 +137,11 @@ static inline int ltx_backend_migrate_ctx(ggml_context * ctx, ggml_backend_t bac
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         if (ggml_backend_buft_get_alloc_size(buft, t) == 0) continue;
         if (i >= buf_out.size()) break;
-        ggml_tallocr talloc = ggml_tallocr_new(buf_out[i]);
         void * old_data = t->data;
         size_t nbytes = ggml_nbytes(t);
+        t->data = nullptr;
+        t->buffer = nullptr;
+        ggml_tallocr talloc = ggml_tallocr_new(buf_out[i]);
         ggml_tallocr_alloc(&talloc, t);
         ggml_backend_tensor_set(t, old_data, 0, nbytes);
         ++i;
