@@ -332,23 +332,17 @@ struct LtxDiT {
         return true;
     }
 
-    // ── Forward pass ─────────────────────────────────────────────────────────
-    //
-    // Builds the entire DiT forward graph in one shot and dispatches via
-    // ggml_backend_sched (Metal + CPU auto-scheduled).
-    //
-    // Inputs:
-    //   latents:   [n_tok, patch_dim]  patchified video latent
-    //   text_emb:  [seq_len, cross_dim] T5 encoder output
-    //   timestep:  scalar in [0,1]     noise level
-    //   sched:     backend scheduler (Metal+CPU or CPU-only)
-    //
-    // Returns predicted velocity: [n_tok × patch_dim]
-    std::vector<float> forward(
-            const float * latents,  int n_tok,
-            const float * text_emb, int seq_len,
-            float         timestep,
-            ggml_backend_sched_t sched) const
+    // Graph size for scheduler: must be >= n_nodes + n_leafs (reserve/alloc_graph).
+    static size_t forward_graph_node_count(const DiTConfig & c) {
+        return (size_t)c.num_layers * 128 + 512;
+    }
+
+    // Build the DiT forward graph into ctx/gf. Optionally return input/output tensors (if non-null).
+    // Used for: 1) reserve (out_* = nullptr), 2) forward (out_* set for tensor_set/get).
+    bool build_forward_graph(
+            struct ggml_context * ctx, struct ggml_cgraph * gf, int n_tok, int seq_len,
+            struct ggml_tensor ** out_x_in, struct ggml_tensor ** out_ctx_in,
+            struct ggml_tensor ** out_t_in, struct ggml_tensor ** out_velocity) const
     {
         int D   = cfg.hidden_size;
         int Pd  = cfg.patch_dim();
@@ -356,19 +350,6 @@ struct LtxDiT {
         int H   = cfg.num_heads;
         int Dh  = cfg.head_dim;
 
-        // Allocate graph metadata context (no_alloc — sched owns actual buffers).
-        // Per-block: ~120 nodes (SA + CA + FFN + AdaLN + q/k norms); 28 blocks → ~3360 nodes
-        const size_t MAX_NODES = (size_t)cfg.num_layers * 128 + 512;
-        size_t ctx_size = ggml_tensor_overhead() * MAX_NODES * 2
-                        + ggml_graph_overhead_custom(MAX_NODES, false);
-        std::vector<uint8_t> ctx_buf(ctx_size);
-        struct ggml_init_params ip = { ctx_size, ctx_buf.data(), /*no_alloc=*/true };
-        struct ggml_context * ctx = ggml_init(ip);
-        if (!ctx) { LTX_ERR("DiT: ggml_init failed"); return {}; }
-
-        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
-
-        // ── Inputs ────────────────────────────────────────────────────────────
         struct ggml_tensor * x_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Pd, n_tok);
         struct ggml_tensor * ctx_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Cd, seq_len);
         struct ggml_tensor * t_in   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
@@ -518,7 +499,63 @@ struct LtxDiT {
         ggml_set_output(x);
         ggml_build_forward_expand(gf, x);
 
-        // ── Schedule → allocate → set inputs → compute → retrieve ────────────
+        if (out_x_in)   *out_x_in   = x_in;
+        if (out_ctx_in) *out_ctx_in = ctx_in;
+        if (out_t_in)   *out_t_in   = t_in;
+        if (out_velocity) *out_velocity = x;
+        return true;
+    }
+
+    // Pre-allocate scheduler buffers from a measure graph (same n_tok/seq_len as forward).
+    // Call once before the denoise loop to avoid realloc on every step.
+    bool reserve_sched(ggml_backend_sched_t sched, int n_tok, int seq_len) const {
+        const size_t MAX_NODES = forward_graph_node_count(cfg);
+        size_t ctx_size = ggml_tensor_overhead() * MAX_NODES * 2
+                        + ggml_graph_overhead_custom(MAX_NODES, false);
+        std::vector<uint8_t> ctx_buf(ctx_size);
+        struct ggml_init_params ip = { ctx_size, ctx_buf.data(), true };
+        struct ggml_context * ctx = ggml_init(ip);
+        if (!ctx) { LTX_ERR("DiT: ggml_init failed (reserve)"); return false; }
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+        if (!build_forward_graph(ctx, gf, n_tok, seq_len, nullptr, nullptr, nullptr, nullptr)) {
+            ggml_free(ctx);
+            return false;
+        }
+        if (!ggml_backend_sched_reserve(sched, gf)) {
+            LTX_ERR("DiT: sched reserve failed"); ggml_free(ctx); return false;
+        }
+        ggml_free(ctx);
+        return true;
+    }
+
+    // ── Forward pass ─────────────────────────────────────────────────────────
+    //
+    // Builds the DiT forward graph, allocates (reusing reserved buffers if reserve_sched was called),
+    // sets inputs, runs compute, returns predicted velocity [n_tok × patch_dim].
+    //
+    std::vector<float> forward(
+            const float * latents,  int n_tok,
+            const float * text_emb, int seq_len,
+            float         timestep,
+            ggml_backend_sched_t sched) const
+    {
+        int Pd = cfg.patch_dim();
+        int Cd = cfg.cross_attn_dim;
+        const size_t MAX_NODES = forward_graph_node_count(cfg);
+        size_t ctx_size = ggml_tensor_overhead() * MAX_NODES * 2
+                        + ggml_graph_overhead_custom(MAX_NODES, false);
+        std::vector<uint8_t> ctx_buf(ctx_size);
+        struct ggml_init_params ip = { ctx_size, ctx_buf.data(), true };
+        struct ggml_context * ctx = ggml_init(ip);
+        if (!ctx) { LTX_ERR("DiT: ggml_init failed"); return {}; }
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+        struct ggml_tensor * x_in = nullptr, * ctx_in = nullptr, * t_in = nullptr, * velocity = nullptr;
+        if (!build_forward_graph(ctx, gf, n_tok, seq_len, &x_in, &ctx_in, &t_in, &velocity)) {
+            ggml_free(ctx);
+            return {};
+        }
+
         ggml_backend_sched_reset(sched);
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             LTX_ERR("DiT: sched alloc failed"); ggml_free(ctx); return {};
@@ -532,7 +569,7 @@ struct LtxDiT {
         }
 
         std::vector<float> out((size_t)n_tok * Pd);
-        ggml_backend_tensor_get(x, out.data(), 0, out.size() * sizeof(float));
+        ggml_backend_tensor_get(velocity, out.data(), 0, out.size() * sizeof(float));
         ggml_free(ctx);
         return out;
     }

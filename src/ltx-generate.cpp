@@ -281,12 +281,13 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Scheduler: [GPU, CPU] (or CPU-only). Automatically routes ops to the best available backend.
+    // Scheduler: [GPU, CPU] (or CPU-only). graph_size must be >= DiT graph n_nodes + n_leafs for reserve/alloc.
     ggml_backend_t sched_backends[2];
     int n_sched = 0;
     if (gpu_backend) sched_backends[n_sched++] = gpu_backend;
     sched_backends[n_sched++] = cpu_backend;
-    ggml_backend_sched_t sched = ggml_backend_sched_new(sched_backends, nullptr, n_sched, 8192, false, true);
+    size_t sched_graph_size = (size_t)LtxDiT::forward_graph_node_count(dit.cfg) * 2;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(sched_backends, nullptr, n_sched, (int)sched_graph_size, false, true);
     LTX_LOG("scheduler: %d backend(s)", n_sched);
 
     // ── Perf monitor (optional --perf flag) ──────────────────────────────────
@@ -329,6 +330,12 @@ int main(int argc, char ** argv) {
 
     LTX_LOG("latent: T=%d H=%d W=%d C=%d  → %d tokens (patch_dim=%d)",
             T_lat, H_lat, W_lat, C, n_tok, Pd);
+
+    // ── Reserve scheduler buffers from DiT graph (avoids realloc every step) ───
+    if (dit.reserve_sched(sched, n_tok, seq_len))
+        LTX_LOG("scheduler: buffers reserved for DiT graph");
+    else
+        LTX_LOG("scheduler: reserve skipped (will alloc each step)");
 
     // ── Encode reference frames (I2V conditioning) ────────────────────────────
 

@@ -77,8 +77,8 @@ BIN=build_debug/ltx-generate bash scripts/test-gpu-migration.sh
 ## Architecture notes
 
 - **Backend**: `ggml_backend_init_best()` auto-selects Metal/CUDA/etc; falls back to CPU. DiT weights are migrated to the backend via `ltx_backend_migrate_ctx`.
-- **DiT forward**: chunked execution — one transformer block at a time, same scratch buffer reused. Metal path uses `no_alloc` + backend buffers (scratch is unused). CPU path bump-allocates from scratch (~64 × n_tok × hidden_size × f32).
-- **Scratch sizing**: computed from actual `n_tok` and `hidden_size` after model load; 1 byte on GPU path, capped at 32 GB on CPU.
+- **DiT forward**: single full graph per step, dispatched via `ggml_backend_sched` (Metal + CPU). Inputs: latents, text_emb, timestep; output: velocity.
+- **Scheduler reserve**: Before the denoise loop, `reserve_sched(sched, n_tok, seq_len)` pre-allocates backend buffers from a measure graph so each step reuses them (avoids realloc overhead).
 - **CFG**: two forward passes per step (cond + uncond) when `cfg_scale > 1.0`.
 - **LTX_MIGRATE_MAX_TENSOR_MB**: env var to override per-tensor GPU migration cap (default 6 GB). Set to `0` to attempt full migration.
 
