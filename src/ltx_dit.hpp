@@ -20,6 +20,7 @@
 //   dit.proj_out.{weight,bias}
 
 #include "ltx_common.hpp"
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -539,6 +540,10 @@ struct LtxDiT {
             float         timestep,
             ggml_backend_sched_t sched) const
     {
+        using clock = std::chrono::steady_clock;
+        using ms    = std::chrono::duration<double, std::milli>;
+        auto t0 = clock::now();
+
         int Pd = cfg.patch_dim();
         int Cd = cfg.cross_attn_dim;
         const size_t MAX_NODES = forward_graph_node_count(cfg);
@@ -555,21 +560,39 @@ struct LtxDiT {
             ggml_free(ctx);
             return {};
         }
+        auto t_build = clock::now();
 
         ggml_backend_sched_reset(sched);
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             LTX_ERR("DiT: sched alloc failed"); ggml_free(ctx); return {};
         }
+        auto t_alloc = clock::now();
+
         ggml_backend_tensor_set(x_in,   latents,   0, (size_t)n_tok   * Pd * sizeof(float));
         ggml_backend_tensor_set(ctx_in, text_emb,  0, (size_t)seq_len * Cd * sizeof(float));
         ggml_backend_tensor_set(t_in,   &timestep, 0, sizeof(float));
+        auto t_set = clock::now();
 
         if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
             LTX_ERR("DiT: compute failed"); ggml_free(ctx); return {};
         }
+        auto t_compute = clock::now();
 
         std::vector<float> out((size_t)n_tok * Pd);
         ggml_backend_tensor_get(velocity, out.data(), 0, out.size() * sizeof(float));
+        auto t_get = clock::now();
+
+        fprintf(stderr, "[ltx-dit] t=%.3f  build=%.1fms  alloc=%.1fms  set=%.1fms"
+                        "  compute=%.0fms  get=%.1fms  nodes=%d\n",
+                (double)timestep,
+                ms(t_build   - t0).count(),
+                ms(t_alloc   - t_build).count(),
+                ms(t_set     - t_alloc).count(),
+                ms(t_compute - t_set).count(),
+                ms(t_get     - t_compute).count(),
+                ggml_graph_n_nodes(gf));
+        fflush(stderr);
+
         ggml_free(ctx);
         return out;
     }
