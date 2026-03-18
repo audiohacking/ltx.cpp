@@ -86,21 +86,21 @@ hf_download() {
 # ── Model file definitions (existing GGUF on Hugging Face) ─────────────────────
 
 declare -A DIT_FILES=(
-    ["Q2_K"]="ltx-2.3-22b-dev-Q2_K.gguf"
-    ["Q3_K_M"]="ltx-2.3-22b-dev-Q3_K_M.gguf"
-    ["Q3_K_S"]="ltx-2.3-22b-dev-Q3_K_S.gguf"
-    ["Q4_0"]="ltx-2.3-22b-dev-Q4_0.gguf"
-    ["Q4_1"]="ltx-2.3-22b-dev-Q4_1.gguf"
-    ["Q4_K_M"]="ltx-2.3-22b-dev-Q4_K_M.gguf"
-    ["Q4_K_S"]="ltx-2.3-22b-dev-Q4_K_S.gguf"
-    ["Q5_0"]="ltx-2.3-22b-dev-Q5_0.gguf"
-    ["Q5_1"]="ltx-2.3-22b-dev-Q5_1.gguf"
-    ["Q5_K_M"]="ltx-2.3-22b-dev-Q5_K_M.gguf"
-    ["Q5_K_S"]="ltx-2.3-22b-dev-Q5_K_S.gguf"
-    ["Q6_K"]="ltx-2.3-22b-dev-Q6_K.gguf"
-    ["Q8_0"]="ltx-2.3-22b-dev-Q8_0.gguf"
-    ["BF16"]="ltx-2.3-22b-dev-BF16.gguf"
-    ["F16"]="ltx-2.3-22b-dev-F16.gguf"
+    ['Q2_K']="ltx-2.3-22b-dev-Q2_K.gguf"
+    ['Q3_K_M']="ltx-2.3-22b-dev-Q3_K_M.gguf"
+    ['Q3_K_S']="ltx-2.3-22b-dev-Q3_K_S.gguf"
+    ['Q4_0']="ltx-2.3-22b-dev-Q4_0.gguf"
+    ['Q4_1']="ltx-2.3-22b-dev-Q4_1.gguf"
+    ['Q4_K_M']="ltx-2.3-22b-dev-Q4_K_M.gguf"
+    ['Q4_K_S']="ltx-2.3-22b-dev-Q4_K_S.gguf"
+    ['Q5_0']="ltx-2.3-22b-dev-Q5_0.gguf"
+    ['Q5_1']="ltx-2.3-22b-dev-Q5_1.gguf"
+    ['Q5_K_M']="ltx-2.3-22b-dev-Q5_K_M.gguf"
+    ['Q5_K_S']="ltx-2.3-22b-dev-Q5_K_S.gguf"
+    ['Q6_K']="ltx-2.3-22b-dev-Q6_K.gguf"
+    ['Q8_0']="ltx-2.3-22b-dev-Q8_0.gguf"
+    ['BF16']="ltx-2.3-22b-dev-BF16.gguf"
+    ['F16']="ltx-2.3-22b-dev-F16.gguf"
 )
 
 T5_FILE="t5-v1_1-xxl-encoder-Q8_0.gguf"
@@ -117,7 +117,7 @@ if [[ $DOWNLOAD_ALL -eq 1 ]]; then
         echo "Downloading DiT [$q]: $f"
         hf_download "$HF_REPO" "$f" "$MODELS_DIR/$f"
     done
-    DIT_EXAMPLE="${DIT_FILES[Q4_K_M]}"
+    DIT_EXAMPLE="${DIT_FILES['Q4_K_M']}"
 else
     fn="${DIT_FILES[$QUANT]:-}"
     if [[ -z "$fn" ]]; then
