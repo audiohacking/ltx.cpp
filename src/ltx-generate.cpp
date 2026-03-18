@@ -23,6 +23,7 @@
 #include "video_vae.hpp"
 #include "ltx_dit.hpp"
 #include "scheduler.hpp"
+#include "ltx_perf.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -33,33 +34,7 @@
 #  include <direct.h>   // _mkdir
 #endif
 
-#if defined(__APPLE__)
-#  include <sys/types.h>
-#  include <sys/sysctl.h>
-#elif defined(__linux__)
-#  include <sys/sysinfo.h>
-#endif
 
-// Up to 85% of system RAM for DiT scratch (min 1 GB). Avoids pulling sys/param.h in the header on macOS.
-size_t dit_scratch_size_bytes() {
-    size_t total_bytes = 0;
-#if defined(__APPLE__)
-    int mib[2] = { CTL_HW, HW_MEMSIZE };
-    int64_t memsize = 0;
-    size_t len = sizeof(memsize);
-    if (sysctl(mib, 2, &memsize, &len, nullptr, 0) == 0 && memsize > 0)
-        total_bytes = (size_t)memsize;
-#elif defined(__linux__)
-    struct sysinfo si;
-    if (sysinfo(&si) == 0 && si.totalram > 0)
-        total_bytes = (size_t)si.totalram * (size_t)si.mem_unit;
-#endif
-    if (total_bytes == 0)
-        return (size_t)8 * 1024 * 1024 * 1024; // fallback 8 GB
-    size_t max_scratch = (size_t)((double)total_bytes * 0.85);
-    size_t min_scratch = (size_t)1 * 1024 * 1024 * 1024; // at least 1 GB
-    return max_scratch > min_scratch ? max_scratch : min_scratch;
-}
 
 // ── Image loading (single TU to avoid duplicate stb symbols) ─────────────────
 #define STB_IMAGE_IMPLEMENTATION
@@ -132,6 +107,7 @@ struct Args {
     uint64_t seed              = 42;
     int    threads             = 4;
     bool   verbose             = false;
+    bool   perf               = false;   // --perf: background CPU/RAM stats every 10 s
 };
 
 static void print_usage(const char * prog) {
@@ -163,7 +139,8 @@ static void print_usage(const char * prog) {
         "\n"
         "Performance:\n"
         "  --threads <N>     CPU threads (default: 4)\n"
-        "  -v                Verbose logging\n",
+        "  -v                Verbose logging\n"
+        "  --perf            Print CPU/RAM stats to stderr every 10 s\n",
         prog);
 }
 
@@ -196,6 +173,7 @@ static Args parse_args(int argc, char ** argv) {
         else if (arg == "--end-frame")      a.end_frame_path    = nextarg();
         else if (arg == "--frame-strength") a.frame_strength    = std::atof(nextarg());
         else if (arg == "-v")        a.verbose         = true;
+        else if (arg == "--perf")    a.perf            = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); exit(0); }
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); exit(1); }
     }
@@ -290,6 +268,14 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // ── Perf monitor (optional --perf flag) ──────────────────────────────────
+    size_t gpu_weight_mb = 0;
+    for (ggml_backend_buffer_t b : dit_weight_buffers) gpu_weight_mb += ggml_backend_buffer_get_size(b) / (1024 * 1024);
+    std::string backend_name = backend ? std::string(ggml_backend_name(backend)) : "";
+    std::unique_ptr<LtxPerfMonitor> perf_mon;
+    if (args.perf)
+        perf_mon = std::make_unique<LtxPerfMonitor>(10, backend_name, gpu_weight_mb);
+
     // ── Text encoding ─────────────────────────────────────────────────────────
 
     LTX_LOG("encoding prompt ...");
@@ -363,14 +349,27 @@ int main(int argc, char ** argv) {
     std::vector<float> latents(lat_size);
     rng.fill(latents.data(), lat_size);
 
-    // ── Persistent DiT scratch (gpt-2 style: one buffer, reused each forward) ─
-    size_t dit_scratch_size = dit_scratch_size_bytes();
+    // ── Persistent DiT scratch (reused each forward pass) ─────────────────────
+    // Metal/GPU path: forward() uses no_alloc+backend buffers; scratch is unused.
+    // CPU path: ggml bump-allocates one block's intermediates from this buffer.
+    //   Peak ≈ 64 × n_tok × hidden_size × f32 + 64 MB overhead.
+    size_t dit_scratch_size;
+    if (backend) {
+        dit_scratch_size = 1; // unused on GPU/Metal path
+    } else {
+        size_t per_tok = (size_t)64 * dit.cfg.hidden_size * sizeof(float);
+        dit_scratch_size = per_tok * (size_t)n_tok + (size_t)64 * 1024 * 1024;
+        // Cap at 32 GB (very generous upper bound for any foreseeable config)
+        if (dit_scratch_size > (size_t)32 * 1024 * 1024 * 1024)
+            dit_scratch_size = (size_t)32 * 1024 * 1024 * 1024;
+    }
     void * dit_scratch_buf = std::malloc(dit_scratch_size);
     if (!dit_scratch_buf) {
-        LTX_ERR("failed to allocate DiT scratch (%.1f GB)", (double)dit_scratch_size / (1024 * 1024 * 1024));
+        LTX_ERR("failed to allocate DiT scratch (%zu MB)", dit_scratch_size / (1024 * 1024));
         return 1;
     }
-    LTX_LOG("DiT scratch: %.1f GB", (double)dit_scratch_size / (1024 * 1024 * 1024));
+    if (!backend)
+        LTX_LOG("DiT scratch: %zu MB (CPU path, n_tok=%d)", dit_scratch_size / (1024 * 1024), n_tok);
 
     // ── Denoising loop ────────────────────────────────────────────────────────
 
@@ -386,7 +385,7 @@ int main(int argc, char ** argv) {
         if (args.verbose) {
             LTX_LOG("  step %d/%d  t=%.4f → %.4f", step + 1, args.steps, (double)t_cur, (double)t_next);
         } else {
-            fprintf(stderr, "\r[ltx] step %d/%d  t=%.3f", step + 1, args.steps, (double)t_cur);
+            fprintf(stderr, "\r[ltx] step %2d/%d  t=%.3f  ", step + 1, args.steps, (double)t_cur);
             fflush(stderr);
         }
 
@@ -397,7 +396,7 @@ int main(int argc, char ** argv) {
         // Conditional velocity.
         std::vector<float> v_cond = dit.forward(
             patches.data(), n_tok, text_emb.data(), seq_len, t_cur,
-            dit_scratch_buf, dit_scratch_size, backend);
+            dit_scratch_buf, dit_scratch_size, backend, /*show_blocks=*/!args.verbose);
 
         if (v_cond.empty()) { std::free(dit_scratch_buf); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (backend) ggml_backend_free(backend); return 1; }
 
@@ -411,7 +410,7 @@ int main(int argc, char ** argv) {
             // Unconditional velocity.
             std::vector<float> v_uncond = dit.forward(
                 patches.data(), n_tok, uncond_emb.data(), seq_len, t_cur,
-                dit_scratch_buf, dit_scratch_size, backend);
+                dit_scratch_buf, dit_scratch_size, backend, /*show_blocks=*/false);
             if (v_uncond.empty()) { std::free(dit_scratch_buf); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (backend) ggml_backend_free(backend); return 1; }
             std::vector<float> vel_uncond = unpatchify(
                 v_uncond.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);

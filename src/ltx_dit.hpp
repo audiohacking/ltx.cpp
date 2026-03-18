@@ -25,8 +25,6 @@
 #include <cstdint>
 #include <cstdio>
 
-// Returns scratch size in bytes: up to 90% of system RAM (min 1 GB). Implemented in ltx-generate.cpp to avoid pulling sys/param.h on macOS.
-size_t dit_scratch_size_bytes();
 
 // ── LTX DiT config ───────────────────────────────────────────────────────────
 
@@ -348,7 +346,8 @@ struct LtxDiT {
             const float * text_emb,  int seq_len,
             float timestep,
             void * scratch_buf, size_t scratch_size,
-            ggml_backend_t backend = nullptr) const
+            ggml_backend_t backend = nullptr,
+            bool show_blocks = false) const
     {
         (void)timestep;
         if (!scratch_buf || scratch_size == 0) { LTX_ERR("DiT forward: scratch_buf and scratch_size required"); return {}; }
@@ -577,6 +576,10 @@ struct LtxDiT {
         // ── Blocks: one context per block, same scratch buffer ─────────────────
         for (int li = 0; li < cfg.num_layers; ++li) {
             const auto & B = blocks[li];
+            if (show_blocks) {
+                fprintf(stderr, "\r[ltx]   block %2d/%d  ", li + 1, cfg.num_layers);
+                fflush(stderr);
+            }
             if (backend) { ctx = ggml_init(params); if (!ctx) { LTX_ERR("DiT: block ggml_init failed"); return {}; } }
             struct ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
             if (!backend) memcpy(x_in->data, x_host.data(), (size_t)D * n_tok * sizeof(float));
