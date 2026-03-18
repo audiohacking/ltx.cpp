@@ -10,30 +10,35 @@
 #       Use a VAE GGUF if you have one, or the safetensors path for other tools.
 #
 # Usage:
-#   ./models.sh              # Download DiT (Q4_K_M) + T5 (Q8_0) + VAE (safetensors)
+#   ./models.sh              # DiT + T5 + VAE + full extras (audio VAE, embeddings, LoRA, upscaler, Gemma)
 #   ./models.sh --quant Q8_0
-#   ./models.sh --all        # Download all DiT quantizations
+#   ./models.sh --all        # All DiT quantizations + T5 + VAE + extras
 #   ./models.sh --dit-only   # DiT only
+#   ./models.sh --minimal    # DiT + T5 + VAE only (no extras)
 
 set -euo pipefail
 
 HF_REPO="unsloth/LTX-2.3-GGUF"
 HF_REPO_T5="city96/t5-v1_1-xxl-encoder-gguf"
+HF_REPO_LIGHTRICKS="Lightricks/LTX-2.3"
+HF_REPO_GEMMA="unsloth/gemma-3-12b-it-qat-GGUF"
 MODELS_DIR="${MODELS_DIR:-./models}"
 QUANT="${QUANT:-Q4_K_M}"
 DOWNLOAD_ALL=0
 DIT_ONLY=0
+MINIMAL=0
 VAE_VIDEO_FILE="vae/ltx-2.3-22b-dev_video_vae.safetensors"
 
 usage() {
-    echo "Usage: $0 [--quant QUANT] [--all] [--dit-only]"
+    echo "Usage: $0 [--quant QUANT] [--all] [--dit-only] [--minimal]"
     echo ""
     echo "Options:"
     echo "  --quant QUANT    DiT quantization (default: Q4_K_M)"
     echo "                   Choices: Q2_K, Q3_K_M, Q3_K_S, Q4_0, Q4_1, Q4_K_M, Q4_K_S,"
     echo "                            Q5_0, Q5_1, Q5_K_M, Q5_K_S, Q6_K, Q8_0, BF16, F16"
     echo "  --all            Download all DiT quantizations"
-    echo "  --dit-only       Download DiT only (skip T5)"
+    echo "  --dit-only       Download DiT only (skip T5, VAE, extras)"
+    echo "  --minimal        DiT + T5 + VAE only (skip extras: audio VAE, embeddings, LoRA, upscaler, Gemma)"
     echo ""
     echo "Environment:"
     echo "  MODELS_DIR       Directory for model files (default: ./models)"
@@ -45,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --quant)    QUANT="$2"; shift 2 ;;
         --all)      DOWNLOAD_ALL=1; shift ;;
         --dit-only) DIT_ONLY=1; shift ;;
+        --minimal)  MINIMAL=1; shift ;;
         --help|-h)  usage; exit 0 ;;
         *)          echo "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -153,12 +159,25 @@ if [[ $DIT_ONLY -eq 0 ]]; then
     echo ""
     echo "Downloading T5 text encoder: $T5_FILE"
     hf_download "$HF_REPO_T5" "$T5_FILE" "$MODELS_DIR/$T5_FILE"
+
+    echo ""
+    echo "Downloading VAE (video): $VAE_VIDEO_FILE"
+    VAE_DEST="$MODELS_DIR/ltx-2.3-22b-dev_video_vae.safetensors"
+    hf_download "$HF_REPO" "$VAE_VIDEO_FILE" "$VAE_DEST"
 fi
 
-echo ""
-echo "Downloading VAE (video): $VAE_VIDEO_FILE"
-VAE_DEST="$MODELS_DIR/ltx-2.3-22b-dev_video_vae.safetensors"
-hf_download "$HF_REPO" "$VAE_VIDEO_FILE" "$VAE_DEST"
+# ── Full project extras (skip with --minimal or --dit-only) ───────────────────
+
+if [[ $DIT_ONLY -eq 0 && $MINIMAL -eq 0 ]]; then
+    echo ""
+    echo "Downloading extras (audio VAE, embeddings, LoRA, upscaler, Gemma, mmproj) ..."
+    hf_download "$HF_REPO" "vae/ltx-2.3-22b-dev_audio_vae.safetensors" "$MODELS_DIR/ltx-2.3-22b-dev_audio_vae.safetensors"
+    hf_download "$HF_REPO" "text_encoders/ltx-2.3-22b-dev_embeddings_connectors.safetensors" "$MODELS_DIR/ltx-2.3-22b-dev_embeddings_connectors.safetensors"
+    hf_download "$HF_REPO_LIGHTRICKS" "ltx-2.3-22b-distilled-lora-384.safetensors" "$MODELS_DIR/ltx-2.3-22b-distilled-lora-384.safetensors"
+    hf_download "$HF_REPO_LIGHTRICKS" "ltx-2.3-spatial-upscaler-x2-1.0.safetensors" "$MODELS_DIR/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+    hf_download "$HF_REPO_GEMMA" "gemma-3-12b-it-qat-UD-Q4_K_XL.gguf" "$MODELS_DIR/gemma-3-12b-it-qat-UD-Q4_K_XL.gguf"
+    hf_download "$HF_REPO_GEMMA" "mmproj-BF16.gguf" "$MODELS_DIR/mmproj-BF16.gguf"
+fi
 
 echo ""
 echo "Done. Models are in: $MODELS_DIR"
@@ -166,11 +185,11 @@ echo ""
 echo "VAE is from unsloth/LTX-2.3-GGUF (vae/); downloaded as safetensors."
 echo "ltx-generate expects a VAE GGUF; use the safetensors path with tools that support it."
 echo ""
-echo "Quick start (with DiT + T5 + VAE GGUF):"
+echo "Quick start (DiT + T5 + VAE, flat in $MODELS_DIR):"
 echo "  mkdir -p output"
 echo "  ./build/ltx-generate \\"
 echo "    --dit   $MODELS_DIR/$DIT_EXAMPLE \\"
-echo "    --vae   $MODELS_DIR/<vae>.gguf \\"
+echo "    --vae   $MODELS_DIR/ltx-2.3-22b-dev_video_vae.safetensors \\"
 echo "    --t5    $MODELS_DIR/$T5_FILE \\"
 echo "    --prompt \"A beautiful sunrise over mountain peaks\" \\"
 echo "    --frames 25 --height 480 --width 704 \\"
