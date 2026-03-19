@@ -20,6 +20,7 @@
 //   dit.proj_out.{weight,bias}
 
 #include "ltx_common.hpp"
+#include "ltx_lora.hpp"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -338,17 +339,20 @@ struct LtxDiT {
     // ggml_backend_sched (Metal + CPU auto-scheduled).
     //
     // Inputs:
-    //   latents:   [n_tok, patch_dim]  patchified video latent
-    //   text_emb:  [seq_len, cross_dim] T5 encoder output
-    //   timestep:  scalar in [0,1]     noise level
-    //   sched:     backend scheduler (Metal+CPU or CPU-only)
+    //   latents:    [n_tok, patch_dim]  patchified video latent
+    //   text_emb:   [seq_len, cross_dim] T5 encoder output
+    //   timestep:   scalar in [0,1]     noise level
+    //   frame_rate: fps (e.g. 24); embedded and added to timestep emb (LTX 2.3)
+    //   sched:      backend scheduler (Metal+CPU or CPU-only)
     //
     // Returns predicted velocity: [n_tok × patch_dim]
     std::vector<float> forward(
             const float * latents,  int n_tok,
             const float * text_emb, int seq_len,
             float         timestep,
-            ggml_backend_sched_t sched) const
+            float         frame_rate,
+            ggml_backend_sched_t sched,
+            const LtxLoRA * lora = nullptr) const
     {
         int D   = cfg.hidden_size;
         int Pd  = cfg.patch_dim();
@@ -358,7 +362,9 @@ struct LtxDiT {
 
         // Allocate graph metadata context (no_alloc — sched owns actual buffers).
         // Per-block: ~120 nodes (SA + CA + FFN + AdaLN + q/k norms); 28 blocks → ~3360 nodes
-        const size_t MAX_NODES = (size_t)cfg.num_layers * 128 + 512;
+        // With LoRA: ~6 extra nodes per adapted layer (A, B tensors + 4 ops), ~10 layers/block.
+        const size_t LORA_EXTRA = lora ? (size_t)cfg.num_layers * 80 : 0;
+        const size_t MAX_NODES = (size_t)cfg.num_layers * 128 + 512 + LORA_EXTRA;
         size_t ctx_size = ggml_tensor_overhead() * MAX_NODES * 2
                         + ggml_graph_overhead_custom(MAX_NODES, false);
         std::vector<uint8_t> ctx_buf(ctx_size);
@@ -372,17 +378,23 @@ struct LtxDiT {
         struct ggml_tensor * x_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Pd, n_tok);
         struct ggml_tensor * ctx_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Cd, seq_len);
         struct ggml_tensor * t_in   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        ggml_set_name(x_in,   "latents");  ggml_set_input(x_in);
-        ggml_set_name(ctx_in, "text_emb"); ggml_set_input(ctx_in);
-        ggml_set_name(t_in,   "timestep"); ggml_set_input(t_in);
+        struct ggml_tensor * fps_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x_in,   "latents");   ggml_set_input(x_in);
+        ggml_set_name(ctx_in, "text_emb");  ggml_set_input(ctx_in);
+        ggml_set_name(t_in,   "timestep");  ggml_set_input(t_in);
+        ggml_set_name(fps_in, "frame_rate"); ggml_set_input(fps_in);
 
-        // ── Timestep embedding → tproj [6*D] ──────────────────────────────────
-        // t → scale(×1000) → sinusoidal(freq_dim) → linear_1+silu → linear_2+silu
-        // → adaln.linear → [6*D] shared modulation for all blocks
+        // ── Timestep embedding → tproj [9*D] ──────────────────────────────────
+        // t  → scale(×1000) → sinusoidal(freq_dim) → \
+        //                                              add → linear_1+silu → linear_2+silu → adaln.linear
+        // fps → sinusoidal(freq_dim)               → /
         struct ggml_tensor * tproj = nullptr;
         if (adaln.emb_w1 && adaln.emb_w2 && adaln.linear_w) {
             struct ggml_tensor * t_s   = ggml_scale(ctx, t_in, 1000.0f);
             struct ggml_tensor * t_emb = ggml_timestep_embedding(ctx, t_s, cfg.freq_dim, 10000);
+            // Frame-rate embedding: same sinusoidal, added to timestep emb (LTX 2.3).
+            struct ggml_tensor * fps_emb = ggml_timestep_embedding(ctx, fps_in, cfg.freq_dim, 10000);
+            t_emb = ggml_add(ctx, t_emb, fps_emb);
             struct ggml_tensor * h     = ggml_mul_mat(ctx, adaln.emb_w1, t_emb);
             if (adaln.emb_b1) h = ggml_add(ctx, h, adaln.emb_b1);
             h = ggml_silu(ctx, h);
@@ -407,13 +419,32 @@ struct LtxDiT {
 
         // Helper: linear proj → reshape [Dh, H, S] → permute → [Dh, S, H] (flash_attn layout)
         const float attn_scale = 1.0f / sqrtf((float)Dh);
+
+        // Apply LoRA delta to an already-computed output: out += scale * B @ (A @ src).
+        // Uses pre-migrated GPU tensors (lp->gpu_A / gpu_B) — zero per-step data copy.
+        // src shape: [in_feat, S];  out shape: [out_feat, S].
+        auto lora_add = [&](struct ggml_tensor * out, struct ggml_tensor * src,
+                            const std::string & lora_key) -> struct ggml_tensor * {
+            if (!lora || lora_key.empty()) return out;
+            const LoRAPair * lp = lora->find(lora_key);
+            if (!lp || !lp->gpu_A || !lp->gpu_B) return out;
+            // gpu_A/gpu_B are already on the backend (Metal/CPU); reference them directly.
+            struct ggml_tensor * ax    = ggml_mul_mat(ctx, lp->gpu_A, src);  // [rank, S]
+            struct ggml_tensor * delta = ggml_mul_mat(ctx, lp->gpu_B, ax);   // [out_feat, S]
+            delta = ggml_scale(ctx, delta, lora->scale);
+            return ggml_add(ctx, out, delta);
+        };
+
         // Project src → Q/K/V, optionally apply RMS norm (q/k_norm weight [D]) before head-split.
         // norm_w shape: [D] — applied per-token over the full hidden dim before reshape into heads.
+        // lora_key: canonical LoRA key for this projection (empty = no LoRA).
         auto qkv_proj = [&](struct ggml_tensor * W, struct ggml_tensor * b,
                             struct ggml_tensor * norm_w,
-                            struct ggml_tensor * src, int S) -> struct ggml_tensor * {
+                            struct ggml_tensor * src, int S,
+                            const std::string & lora_key = "") -> struct ggml_tensor * {
             struct ggml_tensor * o = ggml_mul_mat(ctx, W, src); // [D, S]
-            if (b)      o = ggml_add(ctx, o, b);
+            if (b) o = ggml_add(ctx, o, b);
+            o = lora_add(o, src, lora_key);
             if (norm_w) {
                 o = ggml_rms_norm(ctx, o, cfg.norm_eps); // normalize per token over D
                 o = ggml_mul(ctx, o, norm_w);            // scale by learned weight [D]
@@ -431,6 +462,8 @@ struct LtxDiT {
         //     [6..8]: FFN (shift_ffn, scale_ffn, gate_ffn)
         for (int li = 0; li < cfg.num_layers; ++li) {
             const auto & B = blocks[li];
+            // LoRA canonical key prefix for this block.
+            std::string lk = lora ? ("transformer_blocks." + std::to_string(li) + ".") : std::string{};
 
             // AdaLN: scale_shift_table [D, 9] + shared tproj [9*D] → 9 modulation vectors
             struct ggml_tensor * shift_sa  = nullptr, * scale_sa  = nullptr, * gate_sa  = nullptr;
@@ -459,15 +492,19 @@ struct LtxDiT {
                 nx = ggml_add(ctx, ggml_add(ctx, nx, ggml_mul(ctx, nx, scale_sa)), shift_sa);
             }
             if (B.attn1_q) {
-                struct ggml_tensor * q = qkv_proj(B.attn1_q, B.attn1_q_b, B.attn1_qnorm, nx, n_tok);
-                struct ggml_tensor * k = qkv_proj(B.attn1_k, B.attn1_k_b, B.attn1_knorm, nx, n_tok);
-                struct ggml_tensor * v = qkv_proj(B.attn1_v, B.attn1_v_b, nullptr,        nx, n_tok);
+                struct ggml_tensor * q = qkv_proj(B.attn1_q, B.attn1_q_b, B.attn1_qnorm, nx, n_tok, lk + "attn1.to_q");
+                struct ggml_tensor * k = qkv_proj(B.attn1_k, B.attn1_k_b, B.attn1_knorm, nx, n_tok, lk + "attn1.to_k");
+                struct ggml_tensor * v = qkv_proj(B.attn1_v, B.attn1_v_b, nullptr,        nx, n_tok, lk + "attn1.to_v");
+                struct ggml_tensor * sa_in = nx; // keep input for LoRA output proj
                 struct ggml_tensor * sa = ggml_flash_attn_ext(ctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
                 sa = ggml_cont(ctx, ggml_reshape_2d(ctx, sa, D, n_tok));
                 if (B.attn1_o) {
+                    struct ggml_tensor * sa_pre_o = sa;
                     sa = ggml_mul_mat(ctx, B.attn1_o, sa);
                     if (B.attn1_o_b) sa = ggml_add(ctx, sa, B.attn1_o_b);
+                    sa = lora_add(sa, sa_pre_o, lk + "attn1.to_out.0");
                 }
+                (void)sa_in;
                 if (gate_sa) sa = ggml_mul(ctx, sa, gate_sa);
                 x = ggml_add(ctx, x, sa);
             }
@@ -478,14 +515,16 @@ struct LtxDiT {
                 cx = ggml_add(ctx, ggml_add(ctx, cx, ggml_mul(ctx, cx, scale_ca)), shift_ca);
             }
             if (B.attn2_q) {
-                struct ggml_tensor * cq = qkv_proj(B.attn2_q, B.attn2_q_b, B.attn2_qnorm, cx,  n_tok);
-                struct ggml_tensor * ck = qkv_proj(B.attn2_k, B.attn2_k_b, B.attn2_knorm, enc, seq_len);
-                struct ggml_tensor * cv = qkv_proj(B.attn2_v, B.attn2_v_b, nullptr,        enc, seq_len);
+                struct ggml_tensor * cq = qkv_proj(B.attn2_q, B.attn2_q_b, B.attn2_qnorm, cx,  n_tok,   lk + "attn2.to_q");
+                struct ggml_tensor * ck = qkv_proj(B.attn2_k, B.attn2_k_b, B.attn2_knorm, enc, seq_len, lk + "attn2.to_k");
+                struct ggml_tensor * cv = qkv_proj(B.attn2_v, B.attn2_v_b, nullptr,        enc, seq_len, lk + "attn2.to_v");
                 struct ggml_tensor * ca = ggml_flash_attn_ext(ctx, cq, ck, cv, nullptr, attn_scale, 0.0f, 0.0f);
                 ca = ggml_cont(ctx, ggml_reshape_2d(ctx, ca, D, n_tok));
                 if (B.attn2_o) {
+                    struct ggml_tensor * ca_pre_o = ca;
                     ca = ggml_mul_mat(ctx, B.attn2_o, ca);
                     if (B.attn2_o_b) ca = ggml_add(ctx, ca, B.attn2_o_b);
+                    ca = lora_add(ca, ca_pre_o, lk + "attn2.to_out.0");
                 }
                 if (gate_ca) ca = ggml_mul(ctx, ca, gate_ca);
                 x = ggml_add(ctx, x, ca);
@@ -497,13 +536,15 @@ struct LtxDiT {
                 if (scale_ffn) {
                     fx = ggml_add(ctx, ggml_add(ctx, fx, ggml_mul(ctx, fx, scale_ffn)), shift_ffn);
                 }
-                struct ggml_tensor * gu      = ggml_mul_mat(ctx, B.ff_gate, fx);
+                struct ggml_tensor * gu = ggml_mul_mat(ctx, B.ff_gate, fx);
                 if (B.ff_gate_b) gu = ggml_add(ctx, gu, B.ff_gate_b);
+                gu = lora_add(gu, fx, lk + "ff.net.0.proj");
                 // LTX 2.3 uses GELU activation (not split GEGLU): ff_dim = ne[1] of ff_gate
                 struct ggml_tensor * ffn_mid = ggml_gelu(ctx, gu);
                 struct ggml_tensor * ffn_out = ggml_mul_mat(ctx, B.ff_down, ffn_mid);
                 if (B.ff_down_b) ffn_out = ggml_add(ctx, ffn_out, B.ff_down_b);
-                if (gate_ffn)    ffn_out = ggml_mul(ctx, ffn_out, gate_ffn);
+                ffn_out = lora_add(ffn_out, ffn_mid, lk + "ff.net.2");
+                if (gate_ffn) ffn_out = ggml_mul(ctx, ffn_out, gate_ffn);
                 x = ggml_add(ctx, x, ffn_out);
             }
         }
@@ -523,9 +564,10 @@ struct LtxDiT {
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             LTX_ERR("DiT: sched alloc failed"); ggml_free(ctx); return {};
         }
-        ggml_backend_tensor_set(x_in,   latents,   0, (size_t)n_tok   * Pd * sizeof(float));
-        ggml_backend_tensor_set(ctx_in, text_emb,  0, (size_t)seq_len * Cd * sizeof(float));
-        ggml_backend_tensor_set(t_in,   &timestep, 0, sizeof(float));
+        ggml_backend_tensor_set(x_in,   latents,    0, (size_t)n_tok   * Pd * sizeof(float));
+        ggml_backend_tensor_set(ctx_in, text_emb,   0, (size_t)seq_len * Cd * sizeof(float));
+        ggml_backend_tensor_set(t_in,   &timestep,  0, sizeof(float));
+        ggml_backend_tensor_set(fps_in, &frame_rate, 0, sizeof(float));
 
         if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
             LTX_ERR("DiT: compute failed"); ggml_free(ctx); return {};

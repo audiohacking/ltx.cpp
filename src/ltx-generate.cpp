@@ -22,6 +22,7 @@
 #include "t5_encoder.hpp"
 #include "video_vae.hpp"
 #include "ltx_dit.hpp"
+#include "ltx_lora.hpp"
 #include "scheduler.hpp"
 #include "ltx_perf.hpp"
 
@@ -30,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <sys/stat.h>   // mkdir
 #if defined(_WIN32)
@@ -204,9 +206,19 @@ struct Args {
     int    frames              = 25;   // LTX rule: 8*n+1 (e.g. 25, 33, 97)
     int    height              = 480;  // must be divisible by 32
     int    width               = 704;  // must be divisible by 32
+    int    frames_per_second   = 24;   // frame rate (for conditioning + output mux hint)
     int    steps               = 20;   // reference: LTXVScheduler 20 steps
     float  cfg_scale           = 4.0f; // reference: CFG 4 first stage
-    float  shift               = 3.0f;
+    float  shift               = 0.0f; // legacy fixed shift (0 = use adaptive formula)
+    float  max_shift           = 2.05f;  // LTXVScheduler adaptive shift max
+    float  base_shift          = 0.95f;  // LTXVScheduler adaptive shift base
+    float  terminal            = 0.1f;   // stop sigma (LTXVScheduler default)
+    bool   stretch             = true;   // stretch sigmas to [terminal, 1.0]
+    // LoRA (distilled model)
+    std::string lora_path;               // path to .safetensors LoRA
+    float  lora_scale          = 1.0f;   // LoRA strength multiplier
+    // Two-stage pipeline
+    bool   two_stage           = false;  // run stage-1 at half-res, stage-2 with LoRA
     uint64_t seed              = 42;
     int    threads             = 4;
     bool   verbose             = false;
@@ -228,9 +240,17 @@ static void print_usage(const char * prog) {
         "  --frames  <N>     Number of video frames, 8*n+1 (default: 25)\n"
         "  --height  <H>     Video height, divisible by 32 (default: 480)\n"
         "  --width   <W>     Video width, divisible by 32 (default: 704)\n"
+        "  --fps     <N>     Output frame rate for conditioning (default: 24)\n"
         "  --steps   <N>     Denoising steps (default: 20)\n"
         "  --cfg     <f>     Classifier-free guidance scale (default: 4.0)\n"
-        "  --shift   <f>     Flow-shift parameter (default: 3.0)\n"
+        "  --shift   <f>     Fixed flow-shift (overrides adaptive; default: adaptive)\n"
+        "  --max-shift <f>   Adaptive shift max (default: 2.05)\n"
+        "  --base-shift <f>  Adaptive shift base (default: 0.95)\n"
+        "  --terminal <f>    Stop sigma; skip near-clean tail (default: 0.1)\n"
+        "  --no-stretch      Disable sigma stretch (stretch on by default)\n"
+        "  --lora    <path>  Distilled LoRA safetensors (optional)\n"
+        "  --lora-scale <f> LoRA strength (default: 1.0)\n"
+        "  --two-stage       Run two-stage pipeline: stage-1 half-res + stage-2 full-res with LoRA\n"
         "  --seed    <N>     RNG seed (default: 42)\n"
         "  --out     <pfx>   Output frame prefix (default: output/frame)\n"
         "\n"
@@ -271,10 +291,18 @@ static Args parse_args(int argc, char ** argv) {
         else if (arg == "--frames")  a.frames          = std::atoi(nextarg());
         else if (arg == "--height")  a.height          = std::atoi(nextarg());
         else if (arg == "--width")   a.width           = std::atoi(nextarg());
-        else if (arg == "--steps")   a.steps           = std::atoi(nextarg());
-        else if (arg == "--cfg")     a.cfg_scale       = std::atof(nextarg());
-        else if (arg == "--shift")   a.shift           = std::atof(nextarg());
-        else if (arg == "--seed")    a.seed            = std::stoull(nextarg());
+        else if (arg == "--fps")        a.frames_per_second = std::atoi(nextarg());
+        else if (arg == "--steps")      a.steps           = std::atoi(nextarg());
+        else if (arg == "--cfg")        a.cfg_scale       = std::atof(nextarg());
+        else if (arg == "--shift")      a.shift           = std::atof(nextarg());
+        else if (arg == "--max-shift")  a.max_shift       = std::atof(nextarg());
+        else if (arg == "--base-shift") a.base_shift      = std::atof(nextarg());
+        else if (arg == "--terminal")   a.terminal        = std::atof(nextarg());
+        else if (arg == "--no-stretch")  a.stretch         = false;
+        else if (arg == "--lora")        a.lora_path       = nextarg();
+        else if (arg == "--lora-scale")  a.lora_scale      = std::atof(nextarg());
+        else if (arg == "--two-stage")   a.two_stage       = true;
+        else if (arg == "--seed")        a.seed            = std::stoull(nextarg());
         else if (arg == "--out")     a.out_prefix      = nextarg();
         else if (arg == "--threads") a.threads         = std::atoi(nextarg());
         else if (arg == "--start-frame")    a.start_frame_path  = nextarg();
@@ -295,6 +323,32 @@ static Args parse_args(int argc, char ** argv) {
 
 // Round up to nearest multiple of k.
 [[maybe_unused]] static int round_up_mult(int v, int k) { return ((v + k - 1) / k) * k; }
+
+// Bilinear upscale latent [T, H_src, W_src, C] → [T, H_dst, W_dst, C].
+// Used for stage-1→stage-2 transition in the two-stage pipeline.
+static std::vector<float> latent_upsample_bilinear(
+        const float * src, int T, int H_src, int W_src, int C,
+        int H_dst, int W_dst)
+{
+    std::vector<float> dst((size_t)T * H_dst * W_dst * C, 0.0f);
+    float sx = (float)W_src / W_dst, sy = (float)H_src / H_dst;
+    for (int t = 0; t < T; ++t)
+    for (int yd = 0; yd < H_dst; ++yd)
+    for (int xd = 0; xd < W_dst; ++xd) {
+        float xf = (xd + 0.5f) * sx - 0.5f, yf = (yd + 0.5f) * sy - 0.5f;
+        int x0 = std::max(0, (int)xf), x1 = std::min(W_src - 1, x0 + 1);
+        int y0 = std::max(0, (int)yf), y1 = std::min(H_src - 1, y0 + 1);
+        float qx = xf - x0, qy = yf - y0;
+        const float * s = src + (size_t)t * H_src * W_src * C;
+        float * d = dst.data() + ((size_t)t * H_dst * W_dst + yd * W_dst + xd) * C;
+        for (int c = 0; c < C; ++c) {
+            float v00 = s[(y0 * W_src + x0) * C + c], v10 = s[(y0 * W_src + x1) * C + c];
+            float v01 = s[(y1 * W_src + x0) * C + c], v11 = s[(y1 * W_src + x1) * C + c];
+            d[c] = (1 - qy) * ((1 - qx) * v00 + qx * v10) + qy * ((1 - qx) * v01 + qx * v11);
+        }
+    }
+    return dst;
+}
 
 // Compute latent dimensions from pixel dimensions.
 static void latent_dims(const Args & a, VaeConfig & vc,
@@ -370,6 +424,24 @@ int main(int argc, char ** argv) {
     LtxDiT dit;
     if (!dit.load(dit_model)) return 1;
 
+    // Optional LoRA (distilled model).
+    LtxLoRA lora;
+    const LtxLoRA * lora_ptr = nullptr;
+    std::vector<ggml_backend_buffer_t> lora_weight_buffers;
+    if (!args.lora_path.empty()) {
+        LTX_LOG("loading LoRA: %s  scale=%.2f", args.lora_path.c_str(), (double)args.lora_scale);
+        if (!lora.load(args.lora_path, args.lora_scale)) {
+            LTX_ERR("LoRA load failed — continuing without LoRA");
+        } else {
+            lora_ptr = &lora;
+        }
+    }
+    // --two-stage requires a LoRA.
+    if (args.two_stage && !lora_ptr) {
+        LTX_ERR("--two-stage requires --lora <path>");
+        return 1;
+    }
+
     // ── Backend: load all plugins, then build Metal+CPU scheduler ───────────
     ggml_backend_load_all();
 
@@ -407,6 +479,17 @@ int main(int argc, char ** argv) {
     sched_backends[n_sched++] = cpu_backend;
     ggml_backend_sched_t sched = ggml_backend_sched_new(sched_backends, nullptr, n_sched, 8192, false, true);
     LTX_LOG("scheduler: %d backend(s)", n_sched);
+
+    // ── LoRA GPU upload ───────────────────────────────────────────────────────
+    // Migrate all LoRA A/B matrices to the same backend as the DiT weights so
+    // the LoRA delta matmuls run on Metal/GPU instead of CPU.
+    if (lora_ptr) {
+        ggml_backend_t lora_backend = gpu_backend ? gpu_backend : cpu_backend;
+        LTX_LOG("uploading LoRA weights to %s ...", ggml_backend_name(lora_backend));
+        if (!lora.gpu_upload(lora_backend, lora_weight_buffers)) {
+            LTX_ERR("LoRA GPU upload failed — LoRA delta matmuls will run on CPU (slow)");
+        }
+    }
 
     // ── Perf monitor (optional --perf flag) ──────────────────────────────────
     size_t gpu_weight_mb = 0;
@@ -504,21 +587,116 @@ int main(int argc, char ** argv) {
         rng.fill(audio_latents.data(), audio_lat_size);
     }
 
-    // ── Denoising loop ────────────────────────────────────────────────────────
+    // ── Two-stage pipeline: stage-1 at half-resolution ───────────────────────
+    // ComfyUI reference: stage-1 at 640×360 (H/2, W/2), 20 steps, CFG=4, dev model (no LoRA).
+    // Then upsample latent and run stage-2 with LoRA, 4 steps, CFG=1.
 
-    RFScheduler rf_sched(args.steps, args.shift, do_cfg);
-    std::vector<float> ts = rf_sched.timesteps();
+    using wall_clock = std::chrono::steady_clock;
+    using wall_sec   = std::chrono::duration<double>;
 
-    LTX_LOG("starting denoising (%d steps) ...", args.steps);
+    if (args.two_stage) {
+        // Stage-1 latent dims: half H/W, same T.
+        int H_lat_1 = (H_lat / 2 / ph) * ph;  // align to patch size
+        int W_lat_1 = (W_lat / 2 / pw) * pw;
+        if (H_lat_1 < ph) H_lat_1 = ph;
+        if (W_lat_1 < pw) W_lat_1 = pw;
+        int n_tok_1 = (T_lat / pt) * (H_lat_1 / ph) * (W_lat_1 / pw);
+        size_t lat_size_1 = (size_t)T_lat * H_lat_1 * W_lat_1 * C;
 
-    for (int step = 0; step < args.steps; ++step) {
+        LTX_LOG("Two-stage: stage-1 T=%d H=%d W=%d (%d tokens), 20 steps, cfg=%.1f",
+                T_lat, H_lat_1, W_lat_1, n_tok_1, (double)args.cfg_scale);
+
+        // Fresh latents at half-res (same seed for reproducibility).
+        std::vector<float> latents_1(lat_size_1);
+        { LtxRng rng1(args.seed); rng1.fill(latents_1.data(), lat_size_1); }
+
+        // Stage-1 scheduler: same LTXVScheduler params, 20 steps, full CFG.
+        const int s1_steps = 20;
+        RFScheduler sched_1(s1_steps, 0.0f, args.cfg_scale > 1.0f,
+                            args.max_shift, args.base_shift, args.terminal, args.stretch);
+        sched_1.set_shift_from_tokens(n_tok_1);
+        std::vector<float> ts_1 = sched_1.timesteps();
+        LTX_LOG("stage-1 scheduler: shift=%.3f", (double)sched_1.shift);
+
+        auto t_s1_start = wall_clock::now();
+        for (int step = 0; step < s1_steps; ++step) {
+            float t_cur = ts_1[step], t_next = ts_1[step + 1];
+            auto t_s = wall_clock::now();
+            fprintf(stderr, "\r[ltx] stage-1 step %2d/%d  t=%.3f  ", step + 1, s1_steps, (double)t_cur);
+            fflush(stderr);
+
+            std::vector<float> patches_1 = patchify(
+                latents_1.data(), T_lat, H_lat_1, W_lat_1, C, pt, ph, pw);
+            float fps = (float)args.frames_per_second;
+
+            // Stage-1: dev model, no LoRA.
+            std::vector<float> vc_1 = dit.forward(
+                patches_1.data(), n_tok_1, text_emb.data(), seq_len, t_cur, fps, sched, nullptr);
+            if (vc_1.empty()) { LTX_ERR("stage-1 DiT forward failed"); return 1; }
+
+            std::vector<float> vel_c_1 = unpatchify(vc_1.data(), T_lat, H_lat_1, W_lat_1, C, pt, ph, pw);
+            std::vector<float> vel_1(lat_size_1);
+            if (args.cfg_scale > 1.0f) {
+                std::vector<float> vu_1 = dit.forward(
+                    patches_1.data(), n_tok_1, uncond_emb.data(), seq_len, t_cur, fps, sched, nullptr);
+                if (vu_1.empty()) { LTX_ERR("stage-1 uncond DiT forward failed"); return 1; }
+                std::vector<float> vel_u_1 = unpatchify(vu_1.data(), T_lat, H_lat_1, W_lat_1, C, pt, ph, pw);
+                RFScheduler::apply_cfg(vel_1.data(), vel_c_1.data(), vel_u_1.data(),
+                                       args.cfg_scale, lat_size_1);
+            } else {
+                vel_1 = vel_c_1;
+            }
+            RFScheduler::euler_step(latents_1.data(), vel_1.data(), t_cur, t_next, lat_size_1);
+
+            double step_s = wall_sec(wall_clock::now() - t_s).count();
+            fprintf(stderr, "  %.1fs/step\n", step_s);
+        }
+        fprintf(stderr, "\n");
+        double s1_elapsed = wall_sec(wall_clock::now() - t_s1_start).count();
+        LTX_LOG("stage-1 done in %.0fs", s1_elapsed);
+
+        // Upsample stage-1 result to full resolution.
+        LTX_LOG("upsampling latent %dx%d → %dx%d ...", H_lat_1, W_lat_1, H_lat, W_lat);
+        latents = latent_upsample_bilinear(latents_1.data(), T_lat, H_lat_1, W_lat_1, C, H_lat, W_lat);
+
+        // Stage-2: override scheduler to explicit distilled sigmas, disable CFG.
+        // ComfyUI uses sigmas = [0.5, 0.125, 0.0625, 0.0].
+        LTX_LOG("stage-2: full-res T=%d H=%d W=%d (%d tokens), %d steps, lora, cfg=1.0",
+                T_lat, H_lat, W_lat, n_tok, args.steps);
+        do_cfg = false;  // distilled model: CFG=1
+    }
+
+    // ── Denoising loop (stage-2 or single-stage) ──────────────────────────────
+
+    // Stage-2 explicit sigmas when --two-stage (ComfyUI: [0.5, 0.125, 0.0625, 0.0]).
+    const std::vector<float> stage2_sigmas = {0.5f, 0.125f, 0.0625f, 0.0f};
+    int loop_steps = args.two_stage ? (int)(stage2_sigmas.size() - 1) : args.steps;
+
+    RFScheduler rf_sched(args.steps,
+                         args.shift > 0.0f ? args.shift : 0.0f,  // 0 = use adaptive
+                         do_cfg,
+                         args.shift > 0.0f ? 0.0f : args.max_shift,
+                         args.base_shift,
+                         args.terminal,
+                         args.stretch);
+    rf_sched.set_shift_from_tokens(n_tok_total > 0 ? n_tok_total : n_tok);
+    std::vector<float> ts = args.two_stage ? stage2_sigmas : rf_sched.timesteps();
+
+    LTX_LOG("scheduler: shift=%.3f terminal=%.2f stretch=%s steps=%d",
+            (double)rf_sched.shift, (double)args.terminal,
+            args.stretch ? "on" : "off", loop_steps);
+    LTX_LOG("starting denoising (%d steps) ...", loop_steps);
+    auto t_denoise_start = wall_clock::now();
+
+    for (int step = 0; step < loop_steps; ++step) {
         float t_cur  = ts[step];
         float t_next = ts[step + 1];
+        auto t_step_start = wall_clock::now();
 
         if (args.verbose) {
-            LTX_LOG("  step %d/%d  t=%.4f → %.4f", step + 1, args.steps, (double)t_cur, (double)t_next);
+            LTX_LOG("  step %d/%d  t=%.4f → %.4f", step + 1, loop_steps, (double)t_cur, (double)t_next);
         } else {
-            fprintf(stderr, "\r[ltx] step %2d/%d  t=%.3f  ", step + 1, args.steps, (double)t_cur);
+            fprintf(stderr, "\r[ltx] step %2d/%d  t=%.3f  ", step + 1, loop_steps, (double)t_cur);
             fflush(stderr);
         }
 
@@ -541,8 +719,9 @@ int main(int argc, char ** argv) {
         }
 
         // Conditional velocity (DiT on video-only or combined AV).
+        float fps = (float)args.frames_per_second;
         std::vector<float> v_cond = dit.forward(
-            dit_input, dit_n_tok, text_emb.data(), seq_len, t_cur, sched);
+            dit_input, dit_n_tok, text_emb.data(), seq_len, t_cur, fps, sched, lora_ptr);
 
         if (v_cond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
 
@@ -554,7 +733,7 @@ int main(int argc, char ** argv) {
         std::vector<float> v_uncond;  // unconditional DiT output (when do_cfg), for video + audio split
         if (do_cfg) {
             v_uncond = dit.forward(
-                dit_input, dit_n_tok, uncond_emb.data(), seq_len, t_cur, sched);
+                dit_input, dit_n_tok, uncond_emb.data(), seq_len, t_cur, fps, sched, lora_ptr);
             if (v_uncond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
             std::vector<float> vel_uncond = unpatchify(
                 v_uncond.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);
@@ -615,11 +794,18 @@ int main(int argc, char ** argv) {
                     lat_tn[i] = lat_tn[i] * (1.0f - blend) + end_lat[i] * blend;
             }
         }
+
+        double step_s = wall_sec(wall_clock::now() - t_step_start).count();
+        double elapsed = wall_sec(wall_clock::now() - t_denoise_start).count();
+        fprintf(stderr, "  %.1fs/step  elapsed=%.0fs\n", step_s, elapsed);
+        fflush(stderr);
     }
     fprintf(stderr, "\n");
     ggml_backend_sched_free(sched);
     for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b);
+    for (auto b : lora_weight_buffers) ggml_backend_buffer_free(b);
     dit_weight_buffers.clear();
+    lora_weight_buffers.clear();
     if (gpu_backend) { ggml_backend_free(gpu_backend); gpu_backend = nullptr; }
     ggml_backend_free(cpu_backend); cpu_backend = nullptr;
 

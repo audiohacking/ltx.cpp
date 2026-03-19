@@ -96,15 +96,17 @@ struct LtxGgufModel {
     }
 };
 
-// Default max size for a single weight buffer (Metal often fails on very large buffers). 0 = no limit.
-// Override with env LTX_MIGRATE_MAX_TENSOR_MB (e.g. 0 to try full migration on high-memory devices).
-static constexpr size_t LTX_MIGRATE_MAX_TENSOR_BYTES_DEFAULT = (size_t)6 * 1024 * 1024 * 1024; // 6 GB
+// Default: unlimited (migrate all tensors). Override with LTX_MIGRATE_MAX_TENSOR_MB env var
+// (e.g. export LTX_MIGRATE_MAX_TENSOR_MB=4096 on GPUs with limited VRAM).
+static constexpr size_t LTX_MIGRATE_MAX_TENSOR_BYTES_DEFAULT = (size_t)-1; // unlimited
 
 // ── Backend: migrate context to backend (backend-agnostic) ───────────────────
 // Moves all tensors in ctx onto the given backend so inference can run on GPU
 // without backend-specific code. Uses one buffer per tensor to avoid single-buffer
-// size limits. Caller must free the returned buffers when done (stored in buf_out).
-// Returns number of buffers created, or 0 on failure / skip (e.g. tensor too large).
+// size limits. Tensors that exceed max_tensor_bytes are silently skipped (left on
+// CPU); the scheduler handles mixed-backend graphs transparently.
+// Caller must free the returned buffers when done (stored in buf_out).
+// Returns number of buffers created, or 0 if no tensors were migrated.
 // Env LTX_MIGRATE_MAX_TENSOR_MB: max size per tensor in MB; 0 = no limit (try full migration).
 static inline int ltx_backend_migrate_ctx(ggml_context * ctx, ggml_backend_t backend,
         std::vector<ggml_backend_buffer_t> & buf_out) {
@@ -116,14 +118,17 @@ static inline int ltx_backend_migrate_ctx(ggml_context * ctx, ggml_backend_t bac
         if (mb >= 0) max_tensor_bytes = (mb == 0) ? (size_t)-1 : (size_t)mb * 1024u * 1024u;
     }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
-    std::vector<size_t> sizes;
+    // First pass: collect (tensor, alloc_size) for tensors that fit.
+    std::vector<std::pair<ggml_tensor *, size_t>> to_migrate;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         size_t sz = ggml_backend_buft_get_alloc_size(buft, t);
-        if (sz > max_tensor_bytes) return 0; // skip migration if any tensor too large
-        if (sz > 0) sizes.push_back(sz);
+        if (sz == 0 || sz > max_tensor_bytes) continue; // skip zero-size or oversized
+        to_migrate.push_back({t, sz});
     }
-    buf_out.reserve(sizes.size());
-    for (size_t sz : sizes) {
+    if (to_migrate.empty()) return 0;
+    // Second pass: allocate backend buffers and copy.
+    buf_out.reserve(to_migrate.size());
+    for (auto & [t, sz] : to_migrate) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(backend, sz);
         if (!buf) {
             for (ggml_backend_buffer_t b : buf_out) ggml_backend_buffer_free(b);
@@ -133,18 +138,15 @@ static inline int ltx_backend_migrate_ctx(ggml_context * ctx, ggml_backend_t bac
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         buf_out.push_back(buf);
     }
-    size_t i = 0;
-    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-        if (ggml_backend_buft_get_alloc_size(buft, t) == 0) continue;
-        if (i >= buf_out.size()) break;
-        void * old_data = t->data;
-        size_t nbytes = ggml_nbytes(t);
-        t->data = nullptr;
+    for (size_t i = 0; i < to_migrate.size(); ++i) {
+        ggml_tensor * t   = to_migrate[i].first;
+        void * old_data   = t->data;
+        size_t nbytes     = ggml_nbytes(t);
+        t->data   = nullptr;
         t->buffer = nullptr;
         ggml_tallocr talloc = ggml_tallocr_new(buf_out[i]);
         ggml_tallocr_alloc(&talloc, t);
         ggml_backend_tensor_set(t, old_data, 0, nbytes);
-        ++i;
     }
     return (int)buf_out.size();
 }
