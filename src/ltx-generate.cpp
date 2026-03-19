@@ -23,6 +23,7 @@
 #include "video_vae.hpp"
 #include "ltx_dit.hpp"
 #include "ltx_lora.hpp"
+#include "audio_vae.hpp"
 #include "scheduler.hpp"
 #include "ltx_perf.hpp"
 
@@ -423,6 +424,16 @@ int main(int argc, char ** argv) {
     if (!dit_model.open(args.dit_path)) return 1;
     LtxDiT dit;
     if (!dit.load(dit_model)) return 1;
+
+    // Optional audio VAE decoder.
+    AudioVaeDecoder audio_vae;
+    bool audio_vae_loaded = false;
+    if (args.av && !args.audio_vae_path.empty()) {
+        LTX_LOG("loading audio VAE: %s", args.audio_vae_path.c_str());
+        audio_vae_loaded = audio_vae.load(args.audio_vae_path);
+        if (!audio_vae_loaded)
+            LTX_ERR("audio VAE load failed — falling back to latent synthesis");
+    }
 
     // Optional LoRA (distilled model).
     LtxLoRA lora;
@@ -869,9 +880,32 @@ int main(int argc, char ** argv) {
 
     // ── Audio output (AV pipeline) ─────────────────────────────────────────────
     if (args.av && !audio_latents.empty()) {
-        const int sample_rate = 16000, hop_length = 160, mel_bins = 64;
-        std::vector<float> waveform = latent_to_waveform(
-            audio_latents.data(), T_lat, sample_rate, hop_length, mel_bins);
+        const int sample_rate = 16000;
+        std::vector<float> waveform;
+
+        if (audio_vae_loaded) {
+            // audio_latents layout: [T_lat, C=8, F=16] — transpose to [C, T, F] for decoder.
+            std::vector<float> lat_ctf((size_t)C_audio * T_lat * F_audio);
+            for (int t = 0; t < T_lat; ++t)
+                for (int c = 0; c < C_audio; ++c)
+                    for (int f = 0; f < F_audio; ++f)
+                        lat_ctf[((size_t)c * T_lat + t) * F_audio + f] =
+                            audio_latents[((size_t)t * C_audio + c) * F_audio + f];
+
+            LTX_LOG("decoding audio latent with AudioVAE ...");
+            std::vector<float> mel = audio_vae.decode(lat_ctf.data(), T_lat);
+            if (!mel.empty()) {
+                int T_mel = T_lat * 4;
+                waveform = audio_vae.mel_to_waveform(mel.data(), T_mel);
+            }
+        }
+
+        if (waveform.empty()) {
+            // Fallback: crude sinusoid synthesis from raw latent.
+            const int hop_length = 160, mel_bins = 64;
+            waveform = latent_to_waveform(audio_latents.data(), T_lat, sample_rate, hop_length, mel_bins);
+        }
+
         if (!waveform.empty() && write_wav(args.out_wav, waveform.data(), waveform.size(), sample_rate))
             LTX_LOG("audio written: %s", args.out_wav.c_str());
         else
