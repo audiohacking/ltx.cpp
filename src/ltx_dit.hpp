@@ -572,6 +572,43 @@ static std::vector<float> patchify(
     return out;
 }
 
+// ── Audio patchify / unpatchify (for AV pipeline) ─────────────────────────────
+// Audio latent layout: [T, C, F] with C=8, F=16 (Lightricks AudioLatentShape).
+// Patchify: (T, C, F) → (T, C*F) so n_audio_tok = T, Pd_audio = 128.
+// Matches Python: "b c t f -> b t (c f)".
+
+static std::vector<float> patchify_audio(
+        const float * lat,
+        int T, int C, int F)
+{
+    int Pd = C * F;
+    std::vector<float> out((size_t)T * Pd);
+    for (int t = 0; t < T; ++t) {
+        float * dst = out.data() + (size_t)t * Pd;
+        int d = 0;
+        for (int c = 0; c < C; ++c)
+            for (int f = 0; f < F; ++f)
+                dst[d++] = lat[((size_t)t * C + c) * F + f];
+    }
+    return out;
+}
+
+static std::vector<float> unpatchify_audio(
+        const float * tok,
+        int T, int C, int F)
+{
+    int Pd = C * F;
+    std::vector<float> out((size_t)T * C * F, 0.0f);
+    for (int t = 0; t < T; ++t) {
+        const float * src = tok + (size_t)t * Pd;
+        int d = 0;
+        for (int c = 0; c < C; ++c)
+            for (int f = 0; f < F; ++f)
+                out[((size_t)t * C + c) * F + f] = src[d++];
+    }
+    return out;
+}
+
 // Unpatchify [N_tok, patch_dim] → [T_lat, H_lat, W_lat, C]
 static std::vector<float> unpatchify(
         const float * tok,

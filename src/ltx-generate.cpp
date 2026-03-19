@@ -25,6 +25,7 @@
 #include "scheduler.hpp"
 #include "ltx_perf.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,103 @@
 #if defined(_WIN32)
 #  include <direct.h>   // _mkdir
 #endif
+
+// ── WAV output (AV pipeline) ──────────────────────────────────────────────────
+// Writes 16-bit mono PCM WAV. sample_rate typically 16000.
+static bool write_wav(const std::string & path,
+        const float * samples, size_t num_samples, int sample_rate)
+{
+    std::FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        LTX_ERR("cannot create WAV file: %s", path.c_str());
+        return false;
+    }
+    size_t data_bytes = num_samples * 2;  // 16-bit
+    unsigned char header[44] = {
+        'R','I','F','F',
+        0,0,0,0,  // file size - 8
+        'W','A','V','E',
+        'f','m','t',' ',
+        16,0,0,0,  // fmt chunk size
+        1,0,       // PCM
+        1,0,       // mono
+        0,0,0,0,  // sample rate (fill below)
+        0,0,0,0,  // byte rate
+        2,0,       // block align
+        16,0,     // bits per sample
+        'd','a','t','a',
+        0,0,0,0   // data size
+    };
+    uint32_t file_size = (uint32_t)(36 + data_bytes);
+    uint32_t sr = (uint32_t)sample_rate;
+    uint32_t byte_rate = sr * 2;
+    header[4] = (unsigned char)(file_size);       header[5] = (unsigned char)(file_size>>8);
+    header[6] = (unsigned char)(file_size>>16); header[7] = (unsigned char)(file_size>>24);
+    header[24] = (unsigned char)(sr);           header[25] = (unsigned char)(sr>>8);
+    header[26] = (unsigned char)(sr>>16);       header[27] = (unsigned char)(sr>>24);
+    header[28] = (unsigned char)(byte_rate);    header[29] = (unsigned char)(byte_rate>>8);
+    header[30] = (unsigned char)(byte_rate>>16); header[31] = (unsigned char)(byte_rate>>24);
+    uint32_t ds = (uint32_t)data_bytes;
+    header[40] = (unsigned char)(ds);            header[41] = (unsigned char)(ds>>8);
+    header[42] = (unsigned char)(ds>>16);        header[43] = (unsigned char)(ds>>24);
+    if (fwrite(header, 1, 44, f) != 44) { fclose(f); return false; }
+    for (size_t i = 0; i < num_samples; ++i) {
+        float s = samples[i];
+        s = std::max(-1.0f, std::min(1.0f, s));
+        int16_t v = (int16_t)(s * 32767.0f);
+        unsigned char b[2] = { (unsigned char)(v & 0xff), (unsigned char)(v >> 8) };
+        if (fwrite(b, 1, 2, f) != 2) { fclose(f); return false; }
+    }
+    fclose(f);
+    LTX_LOG("WAV written: %s (%zu samples, %d Hz)", path.c_str(), num_samples, sample_rate);
+    return true;
+}
+
+// Build a crude waveform from audio latent for AV pipeline (no full audio VAE decoder yet).
+// Latent [T, 8, 16] -> fake mel (T*4, 64) -> overlap-add with sinusoids -> float samples.
+// sample_rate=16000, hop_length=160, mel_bins=64 (LTX reference).
+static std::vector<float> latent_to_waveform(
+        const float * lat, int T_lat, int sample_rate, int hop_length, int mel_bins)
+{
+    const int T_mel = T_lat * 4;  // LATENT_DOWNSAMPLE_FACTOR
+    const size_t num_samples = (size_t)T_mel * hop_length;
+    std::vector<float> out(num_samples, 0.0f);
+    // Mel center frequencies (Hz) for 64 bins, 0..8000 Hz approx
+    std::vector<float> mel_centers((size_t)mel_bins);
+    for (int b = 0; b < mel_bins; ++b) {
+        float m = (float)b / (mel_bins - 1) * 2595.0f * std::log10(1.0f + 8000.0f / 700.0f);
+        mel_centers[(size_t)b] = 700.0f * (std::pow(10.0f, m / 2595.0f) - 1.0f);
+    }
+    for (int t = 0; t < T_mel; ++t) {
+        int t_lat = t / 4;
+        if (t_lat >= T_lat) t_lat = T_lat - 1;
+        size_t sample_start = (size_t)t * hop_length;
+        for (int b = 0; b < mel_bins; ++b) {
+            // Map 64 mel bins from latent (8 ch, 16 freq): use ch = b/16, f = b%16 (first 4 ch)
+            int c = b / 16, f = b % 16;
+            if (c >= 8) c = 7;
+            float mag = lat[((size_t)t_lat * 8 + c) * 16 + f];
+            mag = std::max(0.0f, std::min(1.0f, 0.5f + 0.5f * mag));  // scale latent to positive
+            float phase = 0.0f;  // fixed phase for simplicity
+            float f_hz = mel_centers[(size_t)b];
+            for (int i = 0; i < hop_length && sample_start + i < num_samples; ++i) {
+                float x = (float)((int)sample_start + i) / (float)sample_rate;
+                out[sample_start + i] += mag * std::cos(2.0f * 3.14159265f * f_hz * x + phase);
+            }
+        }
+    }
+    // Normalize
+    float max_val = 0.0f;
+    for (size_t i = 0; i < num_samples; ++i) {
+        float a = std::fabs(out[i]);
+        if (a > max_val) max_val = a;
+    }
+    if (max_val > 1e-6f) {
+        float scale = 0.95f / max_val;
+        for (size_t i = 0; i < num_samples; ++i) out[i] *= scale;
+    }
+    return out;
+}
 
 
 
@@ -95,6 +193,10 @@ struct Args {
     std::string prompt         = "A beautiful scenic landscape with flowing water.";
     std::string negative_prompt = "";
     std::string out_prefix     = "output/frame";
+    // Audio-video: enable AV path, audio VAE path, WAV output
+    bool        av              = false;
+    std::string audio_vae_path;    // required when --av
+    std::string out_wav;           // WAV output path when --av (default: out_prefix + .wav)
     // Image-to-video conditioning.
     std::string start_frame_path;  // path to start/reference frame (PPM)
     std::string end_frame_path;    // path to end frame (PPM), for keyframe interpolation
@@ -131,6 +233,11 @@ static void print_usage(const char * prog) {
         "  --shift   <f>     Flow-shift parameter (default: 3.0)\n"
         "  --seed    <N>     RNG seed (default: 42)\n"
         "  --out     <pfx>   Output frame prefix (default: output/frame)\n"
+        "\n"
+        "Audio-video (AV) pipeline:\n"
+        "  --av              Enable audio+video (concat video+audio latent, DiT, split, decode both)\n"
+        "  --audio-vae <path>  Audio VAE safetensors (optional; when omitted, audio from latent fallback)\n"
+        "  --out-wav  <path>   Output WAV path (default: <out prefix>.wav when --av)\n"
         "\n"
         "Image-to-video (I2V) conditioning:\n"
         "  --start-frame <path>  PNG/JPG/BMP/TGA/PPM image to use as the first frame / reference\n"
@@ -173,6 +280,9 @@ static Args parse_args(int argc, char ** argv) {
         else if (arg == "--start-frame")    a.start_frame_path  = nextarg();
         else if (arg == "--end-frame")      a.end_frame_path    = nextarg();
         else if (arg == "--frame-strength") a.frame_strength    = std::atof(nextarg());
+        else if (arg == "--av")             a.av                = true;
+        else if (arg == "--audio-vae")      a.audio_vae_path    = nextarg();
+        else if (arg == "--out-wav")        a.out_wav           = nextarg();
         else if (arg == "-v")        a.verbose         = true;
         else if (arg == "--perf")    a.perf            = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); exit(0); }
@@ -204,6 +314,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Error: --dit, --vae, and --t5 are all required.\n\n");
         print_usage(argv[0]);
         return 1;
+    }
+    // --audio-vae is optional with --av: when omitted, audio is synthesized from the denoised latent (fallback).
+    if (args.av && args.out_wav.empty()) {
+        args.out_wav = args.out_prefix;
+        size_t slash = args.out_wav.rfind('/');
+        size_t dot   = args.out_wav.find('.', slash == std::string::npos ? 0 : slash);
+        if (dot != std::string::npos)
+            args.out_wav = args.out_wav.substr(0, dot);
+        args.out_wav += ".wav";
     }
 
     // LTX reference: frames = 8*n+1, width/height divisible by 32.
@@ -327,8 +446,16 @@ int main(int argc, char ** argv) {
     int n_tok = (T_lat / pt) * (H_lat / ph) * (W_lat / pw);
     int Pd = dit.cfg.patch_dim();
 
+    // Audio latent (AV pipeline): same T as video, C_audio=8, mel_bins=16 → n_audio_tok = T_lat, Pd_audio=128
+    const int C_audio = 8, F_audio = 16;
+    int n_audio_tok = args.av ? T_lat : 0;
+    int n_tok_total = n_tok + n_audio_tok;
+
     LTX_LOG("latent: T=%d H=%d W=%d C=%d  → %d tokens (patch_dim=%d)",
             T_lat, H_lat, W_lat, C, n_tok, Pd);
+    if (args.av)
+        LTX_LOG("AV: audio latent T=%d C=%d F=%d  → %d audio tokens, total tokens %d",
+                T_lat, C_audio, F_audio, n_audio_tok, n_tok_total);
 
     // ── Encode reference frames (I2V conditioning) ────────────────────────────
 
@@ -370,6 +497,13 @@ int main(int argc, char ** argv) {
     std::vector<float> latents(lat_size);
     rng.fill(latents.data(), lat_size);
 
+    size_t audio_lat_size = args.av ? (size_t)T_lat * C_audio * F_audio : 0;
+    std::vector<float> audio_latents;
+    if (args.av) {
+        audio_latents.resize(audio_lat_size);
+        rng.fill(audio_latents.data(), audio_lat_size);
+    }
+
     // ── Denoising loop ────────────────────────────────────────────────────────
 
     RFScheduler rf_sched(args.steps, args.shift, do_cfg);
@@ -388,26 +522,39 @@ int main(int argc, char ** argv) {
             fflush(stderr);
         }
 
-        // Patchify latent.
+        // Patchify: video [n_tok, Pd]; if AV, audio [n_audio_tok, Pd]; combined = [video; audio].
         std::vector<float> patches = patchify(
             latents.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);
 
-        // Conditional velocity.
+        std::vector<float> combined_patches;
+        const float * dit_input = patches.data();
+        int dit_n_tok = n_tok;
+        if (args.av) {
+            combined_patches.resize((size_t)n_tok_total * Pd);
+            memcpy(combined_patches.data(), patches.data(), (size_t)n_tok * Pd * sizeof(float));
+            std::vector<float> a_patches = patchify_audio(
+                audio_latents.data(), T_lat, C_audio, F_audio);
+            memcpy(combined_patches.data() + (size_t)n_tok * Pd,
+                   a_patches.data(), (size_t)n_audio_tok * Pd * sizeof(float));
+            dit_input = combined_patches.data();
+            dit_n_tok = n_tok_total;
+        }
+
+        // Conditional velocity (DiT on video-only or combined AV).
         std::vector<float> v_cond = dit.forward(
-            patches.data(), n_tok, text_emb.data(), seq_len, t_cur, sched);
+            dit_input, dit_n_tok, text_emb.data(), seq_len, t_cur, sched);
 
         if (v_cond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
 
-        // Unpatchify velocity.
+        // Split AV output: first n_tok tokens → video velocity, rest → audio velocity.
         std::vector<float> vel_cond = unpatchify(
             v_cond.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);
 
         std::vector<float> velocity(lat_size);
-
+        std::vector<float> v_uncond;  // unconditional DiT output (when do_cfg), for video + audio split
         if (do_cfg) {
-            // Unconditional velocity.
-            std::vector<float> v_uncond = dit.forward(
-                patches.data(), n_tok, uncond_emb.data(), seq_len, t_cur, sched);
+            v_uncond = dit.forward(
+                dit_input, dit_n_tok, uncond_emb.data(), seq_len, t_cur, sched);
             if (v_uncond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
             std::vector<float> vel_uncond = unpatchify(
                 v_uncond.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);
@@ -418,9 +565,27 @@ int main(int argc, char ** argv) {
             velocity = vel_cond;
         }
 
-        // Euler step.
+        // Euler step on video latent.
         RFScheduler::euler_step(latents.data(), velocity.data(),
                                 t_cur, t_next, lat_size);
+
+        // Euler step on audio latent (AV).
+        if (args.av) {
+            std::vector<float> audio_vel_cond = unpatchify_audio(
+                v_cond.data() + (size_t)n_tok * Pd, T_lat, C_audio, F_audio);
+            std::vector<float> audio_velocity(audio_lat_size);
+            if (do_cfg) {
+                std::vector<float> audio_vel_uncond = unpatchify_audio(
+                    v_uncond.data() + (size_t)n_tok * Pd, T_lat, C_audio, F_audio);
+                RFScheduler::apply_cfg(
+                    audio_velocity.data(), audio_vel_cond.data(), audio_vel_uncond.data(),
+                    args.cfg_scale, audio_lat_size);
+            } else {
+                audio_velocity = audio_vel_cond;
+            }
+            RFScheduler::euler_step(audio_latents.data(), audio_velocity.data(),
+                                    t_cur, t_next, audio_lat_size);
+        }
 
         // ── Frame conditioning: pin start / end latent frames ──────────────
         // After each Euler step we re-impose the reference frame(s) to prevent
@@ -515,6 +680,17 @@ int main(int argc, char ** argv) {
     }
 
     write_video_frames(vbuf, args.out_prefix);
+
+    // ── Audio output (AV pipeline) ─────────────────────────────────────────────
+    if (args.av && !audio_latents.empty()) {
+        const int sample_rate = 16000, hop_length = 160, mel_bins = 64;
+        std::vector<float> waveform = latent_to_waveform(
+            audio_latents.data(), T_lat, sample_rate, hop_length, mel_bins);
+        if (!waveform.empty() && write_wav(args.out_wav, waveform.data(), waveform.size(), sample_rate))
+            LTX_LOG("audio written: %s", args.out_wav.c_str());
+        else
+            LTX_ERR("failed to write WAV: %s", args.out_wav.c_str());
+    }
 
     LTX_LOG("done. %d frames written to '%s_XXXX.ppm'", T_vid, args.out_prefix.c_str());
     if (has_start || has_end) {
