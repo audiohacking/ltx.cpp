@@ -2,7 +2,9 @@
 
 Portable C++17 inference of **LTX-Video** (Lightricks) using
 [GGML](https://github.com/ggml-org/ggml) / GGUF.  
-Text-to-video generation runs on CPU, with build-time support for CUDA, ROCm, Metal, and Vulkan (same backend-per-build pattern as [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp)). No Python at inference time.
+Text-to-video generation runs on CPU, with build-time support for CUDA, Metal, and Vulkan.
+
+No Python at inference time.
 
 **On the `audio-video` branch**: the same DiT is used for **audio+video** — concatenated video and audio latent tokens, one denoise loop, then split and decode to frames + WAV. See [Audio-video (AV)](#audio-video-av--video--wav-from-the-same-dit) and [docs/AV_PIPELINE.md](docs/AV_PIPELINE.md).
 
@@ -10,6 +12,9 @@ Inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp) and
 [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp).
 
 ---
+
+## Status
+- Experimental, Unstable, Slow. Contributors welcome 👋
 
 ## Features
 
