@@ -20,6 +20,7 @@ struct SafetensorsLoader {
 
     std::vector<TensorInfo>       tensors_;
     std::map<std::string, size_t> name_idx_;
+    std::map<std::string, std::string> metadata_;  // __metadata__ key-value strings
     std::vector<uint8_t>          file_data_;   // entire file mmap'd into RAM
     uint64_t                      data_base_ = 0;
 
@@ -71,7 +72,36 @@ struct SafetensorsLoader {
             }
             const char * obj_end = p;
 
-            if (key == "__metadata__") continue;
+            if (key == "__metadata__") {
+                // Parse simple string key-value pairs from the metadata object.
+                const char * mp = obj + 1;
+                while (mp < obj_end) {
+                    while (mp < obj_end && *mp != '"') ++mp;
+                    if (mp >= obj_end) break;
+                    ++mp;
+                    const char * mk_s = mp;
+                    while (mp < obj_end && *mp != '"') ++mp;
+                    std::string mk(mk_s, (size_t)(mp - mk_s));
+                    ++mp;
+                    while (mp < obj_end && *mp != ':') ++mp;
+                    if (mp >= obj_end) break;
+                    ++mp;
+                    while (mp < obj_end && (*mp == ' ' || *mp == '\t')) ++mp;
+                    if (mp >= obj_end) break;
+                    if (*mp == '"') {
+                        ++mp;
+                        const char * mv_s = mp;
+                        while (mp < obj_end && *mp != '"') ++mp;
+                        metadata_[mk] = std::string(mv_s, (size_t)(mp - mv_s));
+                        if (mp < obj_end) ++mp;
+                    } else {
+                        const char * mv_s = mp;
+                        while (mp < obj_end && *mp != ',' && *mp != '}') ++mp;
+                        metadata_[mk] = std::string(mv_s, (size_t)(mp - mv_s));
+                    }
+                }
+                continue;
+            }
 
             TensorInfo ti;
             ti.name = key;
@@ -121,6 +151,12 @@ struct SafetensorsLoader {
             name_idx_[tensors_.back().name] = idx;
         }
         return !tensors_.empty();
+    }
+
+    // Returns the __metadata__ string value for `key`, or empty string if absent.
+    std::string metadata_string(const std::string & key) const {
+        auto it = metadata_.find(key);
+        return it != metadata_.end() ? it->second : std::string{};
     }
 
     std::vector<std::string> tensor_names() const {

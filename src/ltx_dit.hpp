@@ -41,6 +41,7 @@ struct DiTConfig {
     int latent_channels  = 128;   // VAE latent channels
     int freq_dim         = 256;   // sinusoidal embedding dim
     float norm_eps       = 1e-6f;
+    float rope_theta     = 10000.0f; // RoPE base frequency (from GGUF config)
     // Derived
     int patch_dim() const { return patch_t * patch_h * patch_w * latent_channels; }
 };
@@ -348,6 +349,7 @@ struct LtxDiT {
     // Returns predicted velocity: [n_tok × patch_dim]
     std::vector<float> forward(
             const float * latents,  int n_tok,
+            int           lat_T,    int lat_H, int lat_W,  // latent spatial dims for RoPE
             const float * text_emb, int seq_len,
             float         timestep,
             float         frame_rate,
@@ -364,7 +366,13 @@ struct LtxDiT {
         // Per-block: ~120 nodes (SA + CA + FFN + AdaLN + q/k norms); 28 blocks → ~3360 nodes
         // With LoRA: ~6 extra nodes per adapted layer (A, B tensors + 4 ops), ~10 layers/block.
         const size_t LORA_EXTRA = lora ? (size_t)cfg.num_layers * 80 : 0;
-        const size_t MAX_NODES = (size_t)cfg.num_layers * 128 + 512 + LORA_EXTRA;
+        // Chunked attention: split Q into ≤ ATTN_CHUNK queries per flash_attn call to stay
+        // within Metal's 65535-query limit.  Each chunk adds ~5 nodes (view+attn+reshape+cont+concat).
+        // SA and CA each chunk separately; account for both in MAX_NODES.
+        static constexpr int ATTN_CHUNK = 65534; // Metal flash_attn limit: ne01 < 65536
+        const int n_sa_chunks = (n_tok + ATTN_CHUNK - 1) / ATTN_CHUNK;
+        const size_t CHUNK_NODES = (size_t)cfg.num_layers * 2 * (5 * (size_t)n_sa_chunks + 2);
+        const size_t MAX_NODES = (size_t)cfg.num_layers * 120 + 512 + LORA_EXTRA + CHUNK_NODES;
         size_t ctx_size = ggml_tensor_overhead() * MAX_NODES * 2
                         + ggml_graph_overhead_custom(MAX_NODES, false);
         std::vector<uint8_t> ctx_buf(ctx_size);
@@ -373,6 +381,38 @@ struct LtxDiT {
         if (!ctx) { LTX_ERR("DiT: ggml_init failed"); return {}; }
 
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+
+        // ── 3D split RoPE position IDs ────────────────────────────────────────
+        // LTX 2.3 uses rope_type="split" with theta=10000, max_pos=[20,2048,2048] (T,H,W).
+        // ggml_rope_multi expects: a=[Dh, H, S], b=[n_tok*4] I32 (4 pos IDs per token).
+        // n_vid_tok = lat_T * lat_H * lat_W (video tokens only; audio tokens excluded from SA RoPE).
+        const int n_vid_tok = lat_T * lat_H * lat_W;
+        std::vector<int32_t> pos_data((size_t)n_vid_tok * 4);
+        for (int t = 0; t < lat_T; ++t)
+        for (int h = 0; h < lat_H; ++h)
+        for (int w = 0; w < lat_W; ++w) {
+            int idx = (t * lat_H + h) * lat_W + w;
+            pos_data[(size_t)idx * 4 + 0] = t;  // temporal
+            pos_data[(size_t)idx * 4 + 1] = h;  // height
+            pos_data[(size_t)idx * 4 + 2] = w;  // width
+            pos_data[(size_t)idx * 4 + 3] = 0;  // unused section
+        }
+        // RoPE sections: split Dh equally among (t, h, w) dimensions.
+        const int rope_dt = Dh / 3;
+        const int rope_dh = Dh / 3;
+        const int rope_dw = Dh - rope_dt - rope_dh;
+        int rope_sections[GGML_MROPE_SECTIONS] = { rope_dt, rope_dh, rope_dw, 0 };
+
+        // When n_tok != n_vid_tok (AV combined input), audio tokens lack video spatial coords —
+        // skip RoPE entirely to avoid the ggml_rope_multi assertion (a->ne[2]*4 == b->ne[0]).
+        const bool apply_rope = (n_vid_tok == n_tok);
+
+        struct ggml_tensor * pos_ids = nullptr;
+        if (apply_rope) {
+            pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)n_vid_tok * 4);
+            ggml_set_name(pos_ids, "pos_ids");
+            ggml_set_input(pos_ids);
+        }
 
         // ── Inputs ────────────────────────────────────────────────────────────
         struct ggml_tensor * x_in   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Pd, n_tok);
@@ -438,10 +478,13 @@ struct LtxDiT {
         // Project src → Q/K/V, optionally apply RMS norm (q/k_norm weight [D]) before head-split.
         // norm_w shape: [D] — applied per-token over the full hidden dim before reshape into heads.
         // lora_key: canonical LoRA key for this projection (empty = no LoRA).
+        // pos: when non-null, apply 3D split RoPE (MROPE) after reshape, before permute.
+        //      Used for SA Q and K only (not V, not CA).
         auto qkv_proj = [&](struct ggml_tensor * W, struct ggml_tensor * b,
                             struct ggml_tensor * norm_w,
                             struct ggml_tensor * src, int S,
-                            const std::string & lora_key = "") -> struct ggml_tensor * {
+                            const std::string & lora_key = "",
+                            struct ggml_tensor * pos = nullptr) -> struct ggml_tensor * {
             struct ggml_tensor * o = ggml_mul_mat(ctx, W, src); // [D, S]
             if (b) o = ggml_add(ctx, o, b);
             o = lora_add(o, src, lora_key);
@@ -449,9 +492,43 @@ struct LtxDiT {
                 o = ggml_rms_norm(ctx, o, cfg.norm_eps); // normalize per token over D
                 o = ggml_mul(ctx, o, norm_w);            // scale by learned weight [D]
             }
-            o = ggml_reshape_3d(ctx, o, Dh, H, S);
+            o = ggml_reshape_3d(ctx, o, Dh, H, S);      // [Dh, H, S]
+            if (pos) {
+                // 3D split RoPE: sections = [dt, dh, dw, 0], theta = rope_theta.
+                // ggml_rope_multi expects a=[Dh,H,S], b=[n_tok*4] I32, a->ne[2]*4==b->ne[0].
+                o = ggml_rope_multi(ctx, o, pos, nullptr,
+                                    Dh, rope_sections,
+                                    GGML_ROPE_TYPE_MROPE, 2048,
+                                    cfg.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+            }
             o = ggml_permute(ctx, o, 0, 2, 1, 3); // → [Dh, S, H, 1]
             return ggml_cont(ctx, o);
+        };
+
+        // Chunked flash-attention: split Q into ≤ ATTN_CHUNK rows so Metal's
+        // flash_attn kernel (ne01 < 65536) can handle arbitrarily long sequences.
+        // q/k/v are [Dh, S, H] contiguous (output of qkv_proj).  n_q = query count.
+        // Returns [D, n_q] — same layout as the old single-call reshape.
+        auto chunked_attn = [&](struct ggml_tensor * q, struct ggml_tensor * k,
+                                struct ggml_tensor * v, int n_q) -> struct ggml_tensor * {
+            if (n_q <= ATTN_CHUNK) {
+                struct ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
+                return ggml_cont(ctx, ggml_reshape_2d(ctx, o, D, n_q));
+            }
+            // q is [Dh, n_q, H] contiguous; stride along token dim = Dh*4 bytes.
+            const size_t nb_tok  = (size_t)Dh * sizeof(float);
+            const size_t nb_head = (size_t)Dh * n_q * sizeof(float);
+            struct ggml_tensor * result = nullptr;
+            for (int off = 0; off < n_q; off += ATTN_CHUNK) {
+                int clen = std::min(ATTN_CHUNK, n_q - off);
+                struct ggml_tensor * q_c = ggml_view_3d(ctx, q, Dh, clen, H,
+                                                         nb_tok, nb_head,
+                                                         (size_t)off * nb_tok);
+                struct ggml_tensor * o_c = ggml_flash_attn_ext(ctx, q_c, k, v, nullptr, attn_scale, 0.0f, 0.0f);
+                o_c = ggml_cont(ctx, ggml_reshape_2d(ctx, o_c, D, clen));
+                result = result ? ggml_concat(ctx, result, o_c, 1) : o_c;
+            }
+            return result;
         };
 
         // ── Transformer blocks ─────────────────────────────────────────────────
@@ -492,12 +569,11 @@ struct LtxDiT {
                 nx = ggml_add(ctx, ggml_add(ctx, nx, ggml_mul(ctx, nx, scale_sa)), shift_sa);
             }
             if (B.attn1_q) {
-                struct ggml_tensor * q = qkv_proj(B.attn1_q, B.attn1_q_b, B.attn1_qnorm, nx, n_tok, lk + "attn1.to_q");
-                struct ggml_tensor * k = qkv_proj(B.attn1_k, B.attn1_k_b, B.attn1_knorm, nx, n_tok, lk + "attn1.to_k");
+                struct ggml_tensor * q = qkv_proj(B.attn1_q, B.attn1_q_b, B.attn1_qnorm, nx, n_tok, lk + "attn1.to_q", pos_ids);
+                struct ggml_tensor * k = qkv_proj(B.attn1_k, B.attn1_k_b, B.attn1_knorm, nx, n_tok, lk + "attn1.to_k", pos_ids);
                 struct ggml_tensor * v = qkv_proj(B.attn1_v, B.attn1_v_b, nullptr,        nx, n_tok, lk + "attn1.to_v");
                 struct ggml_tensor * sa_in = nx; // keep input for LoRA output proj
-                struct ggml_tensor * sa = ggml_flash_attn_ext(ctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
-                sa = ggml_cont(ctx, ggml_reshape_2d(ctx, sa, D, n_tok));
+                struct ggml_tensor * sa = chunked_attn(q, k, v, n_tok);
                 if (B.attn1_o) {
                     struct ggml_tensor * sa_pre_o = sa;
                     sa = ggml_mul_mat(ctx, B.attn1_o, sa);
@@ -518,8 +594,7 @@ struct LtxDiT {
                 struct ggml_tensor * cq = qkv_proj(B.attn2_q, B.attn2_q_b, B.attn2_qnorm, cx,  n_tok,   lk + "attn2.to_q");
                 struct ggml_tensor * ck = qkv_proj(B.attn2_k, B.attn2_k_b, B.attn2_knorm, enc, seq_len, lk + "attn2.to_k");
                 struct ggml_tensor * cv = qkv_proj(B.attn2_v, B.attn2_v_b, nullptr,        enc, seq_len, lk + "attn2.to_v");
-                struct ggml_tensor * ca = ggml_flash_attn_ext(ctx, cq, ck, cv, nullptr, attn_scale, 0.0f, 0.0f);
-                ca = ggml_cont(ctx, ggml_reshape_2d(ctx, ca, D, n_tok));
+                struct ggml_tensor * ca = chunked_attn(cq, ck, cv, n_tok);
                 if (B.attn2_o) {
                     struct ggml_tensor * ca_pre_o = ca;
                     ca = ggml_mul_mat(ctx, B.attn2_o, ca);
@@ -564,10 +639,12 @@ struct LtxDiT {
         if (!ggml_backend_sched_alloc_graph(sched, gf)) {
             LTX_ERR("DiT: sched alloc failed"); ggml_free(ctx); return {};
         }
-        ggml_backend_tensor_set(x_in,   latents,    0, (size_t)n_tok   * Pd * sizeof(float));
-        ggml_backend_tensor_set(ctx_in, text_emb,   0, (size_t)seq_len * Cd * sizeof(float));
-        ggml_backend_tensor_set(t_in,   &timestep,  0, sizeof(float));
-        ggml_backend_tensor_set(fps_in, &frame_rate, 0, sizeof(float));
+        ggml_backend_tensor_set(x_in,   latents,         0, (size_t)n_tok   * Pd * sizeof(float));
+        ggml_backend_tensor_set(ctx_in, text_emb,        0, (size_t)seq_len * Cd * sizeof(float));
+        ggml_backend_tensor_set(t_in,   &timestep,       0, sizeof(float));
+        ggml_backend_tensor_set(fps_in, &frame_rate,     0, sizeof(float));
+        if (apply_rope)
+            ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, pos_data.size() * sizeof(int32_t));
 
         if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
             LTX_ERR("DiT: compute failed"); ggml_free(ctx); return {};

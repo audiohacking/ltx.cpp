@@ -56,9 +56,12 @@ struct LtxLoRA {
             LTX_ERR("LoRA: failed to load %s", path.c_str());
             return false;
         }
-        // scale = lora_scale / rank (rank=384 for this file; divide to normalise)
+        // LoRA delta = (alpha / rank) * B @ A @ x.
+        // Read alpha from file metadata; fall back to rank (alpha=rank → scale=1).
         const float rank_f = 384.0f;
-        scale = lora_scale / rank_f;
+        std::string alpha_s = st.metadata_string("lora_alpha");
+        float alpha = alpha_s.empty() ? rank_f : std::stof(alpha_s);
+        scale = lora_scale * (alpha / rank_f);
 
         std::map<std::string, std::vector<float>> A_map, B_map;
         std::map<std::string, std::vector<int64_t>> A_shape, B_shape;

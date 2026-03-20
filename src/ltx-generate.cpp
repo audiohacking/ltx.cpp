@@ -483,13 +483,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Scheduler: [GPU, CPU] (or CPU-only). Automatically routes ops to the best available backend.
-    ggml_backend_t sched_backends[2];
-    int n_sched = 0;
-    if (gpu_backend) sched_backends[n_sched++] = gpu_backend;
-    sched_backends[n_sched++] = cpu_backend;
-    ggml_backend_sched_t sched = ggml_backend_sched_new(sched_backends, nullptr, n_sched, 8192, false, true);
-    LTX_LOG("scheduler: %d backend(s)", n_sched);
+    // Scheduler created after latent dims are known (below), so we can size the hash_set.
 
     // ── LoRA GPU upload ───────────────────────────────────────────────────────
     // Migrate all LoRA A/B matrices to the same backend as the DiT weights so
@@ -539,6 +533,19 @@ int main(int argc, char ** argv) {
     int C = dit.cfg.latent_channels;
     int n_tok = (T_lat / pt) * (H_lat / ph) * (W_lat / pw);
     int Pd = dit.cfg.patch_dim();
+
+    // ── Backend scheduler ────────────────────────────────────────────────────
+    // Size the hash_set to fit the full chunked-attention graph for this resolution.
+    // Each SA+CA chunk pair adds ~5 nodes; 3× headroom for leafs and extra ops.
+    const int n_sa_chunks_est = (n_tok + 65533) / 65534;
+    const size_t chunk_nodes_est = (size_t)dit.cfg.num_layers * 2 * (5 * (size_t)n_sa_chunks_est + 2);
+    const int sched_graph_size = (int)(((size_t)dit.cfg.num_layers * 120 + 512 + chunk_nodes_est) * 3);
+    ggml_backend_t sched_backends[2];
+    int n_sched = 0;
+    if (gpu_backend) sched_backends[n_sched++] = gpu_backend;
+    sched_backends[n_sched++] = cpu_backend;
+    ggml_backend_sched_t sched = ggml_backend_sched_new(sched_backends, nullptr, n_sched, sched_graph_size, false, true);
+    LTX_LOG("scheduler: %d backend(s)", n_sched);
 
     // Audio latent (AV pipeline): same T as video, C_audio=8, mel_bins=16 → n_audio_tok = T_lat, Pd_audio=128
     const int C_audio = 8, F_audio = 16;
@@ -642,14 +649,18 @@ int main(int argc, char ** argv) {
 
             // Stage-1: dev model, no LoRA.
             std::vector<float> vc_1 = dit.forward(
-                patches_1.data(), n_tok_1, text_emb.data(), seq_len, t_cur, fps, sched, nullptr);
+                patches_1.data(), n_tok_1,
+                T_lat/pt, H_lat_1/ph, W_lat_1/pw,
+                text_emb.data(), seq_len, t_cur, fps, sched, nullptr);
             if (vc_1.empty()) { LTX_ERR("stage-1 DiT forward failed"); return 1; }
 
             std::vector<float> vel_c_1 = unpatchify(vc_1.data(), T_lat, H_lat_1, W_lat_1, C, pt, ph, pw);
             std::vector<float> vel_1(lat_size_1);
             if (args.cfg_scale > 1.0f) {
                 std::vector<float> vu_1 = dit.forward(
-                    patches_1.data(), n_tok_1, uncond_emb.data(), seq_len, t_cur, fps, sched, nullptr);
+                    patches_1.data(), n_tok_1,
+                    T_lat/pt, H_lat_1/ph, W_lat_1/pw,
+                    uncond_emb.data(), seq_len, t_cur, fps, sched, nullptr);
                 if (vu_1.empty()) { LTX_ERR("stage-1 uncond DiT forward failed"); return 1; }
                 std::vector<float> vel_u_1 = unpatchify(vu_1.data(), T_lat, H_lat_1, W_lat_1, C, pt, ph, pw);
                 RFScheduler::apply_cfg(vel_1.data(), vel_c_1.data(), vel_u_1.data(),
@@ -679,8 +690,8 @@ int main(int argc, char ** argv) {
 
     // ── Denoising loop (stage-2 or single-stage) ──────────────────────────────
 
-    // Stage-2 explicit sigmas when --two-stage (ComfyUI: [0.5, 0.125, 0.0625, 0.0]).
-    const std::vector<float> stage2_sigmas = {0.5f, 0.125f, 0.0625f, 0.0f};
+    // Stage-2 explicit sigmas when --two-stage (ComfyUI ManualSigmas: 0.909375, 0.725, 0.421875, 0.0).
+    const std::vector<float> stage2_sigmas = {0.909375f, 0.725f, 0.421875f, 0.0f};
     int loop_steps = args.two_stage ? (int)(stage2_sigmas.size() - 1) : args.steps;
 
     RFScheduler rf_sched(args.steps,
@@ -732,7 +743,9 @@ int main(int argc, char ** argv) {
         // Conditional velocity (DiT on video-only or combined AV).
         float fps = (float)args.frames_per_second;
         std::vector<float> v_cond = dit.forward(
-            dit_input, dit_n_tok, text_emb.data(), seq_len, t_cur, fps, sched, lora_ptr);
+            dit_input, dit_n_tok,
+            T_lat/pt, H_lat/ph, W_lat/pw,
+            text_emb.data(), seq_len, t_cur, fps, sched, lora_ptr);
 
         if (v_cond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
 
@@ -744,7 +757,9 @@ int main(int argc, char ** argv) {
         std::vector<float> v_uncond;  // unconditional DiT output (when do_cfg), for video + audio split
         if (do_cfg) {
             v_uncond = dit.forward(
-                dit_input, dit_n_tok, uncond_emb.data(), seq_len, t_cur, fps, sched, lora_ptr);
+                dit_input, dit_n_tok,
+                T_lat/pt, H_lat/ph, W_lat/pw,
+                uncond_emb.data(), seq_len, t_cur, fps, sched, lora_ptr);
             if (v_uncond.empty()) { ggml_backend_sched_free(sched); for (auto b : dit_weight_buffers) ggml_backend_buffer_free(b); if (gpu_backend) ggml_backend_free(gpu_backend); ggml_backend_free(cpu_backend); return 1; }
             std::vector<float> vel_uncond = unpatchify(
                 v_uncond.data(), T_lat, H_lat, W_lat, C, pt, ph, pw);
